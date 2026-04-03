@@ -1,0 +1,3 @@
+numpy
+lmdb
+huggingface_hub
