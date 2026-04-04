@@ -121,11 +121,6 @@ class LLNGraph:
             minlength=self.vocab_size
         ).astype(np.int32)
 
-        # PMI degree: how many PMI neighbors each word has.
-        # High PMI degree = structural word (connected to everything).
-        # Low PMI degree = specific semantic association.
-        self.pmi_degree = np.diff(self.pmi_off)
-
     def _load_trigrams(self, txn):
         """Load trigram index: (prev, cur) -> {next: count}."""
         tri_data = txn.get(b'trigrams_v2')
@@ -167,12 +162,7 @@ class LLNGraph:
         return self.pmi_tgt[s:e], self.pmi_wgt[s:e]
 
     def trigram_score(self, prev_idx, cur_idx, next_idx):
-        """Trigram multiplier for a candidate next token.
-
-        Case 1: No trigram data for (prev, cur) pair → 1.0 (neutral)
-        Case 2: Pair exists but next absent → 0.7 (soft penalty, not a wall)
-        Case 3: Pair exists with count N → 1.0 + log(1+N) (boosted)
-        """
+        """Trigram multiplier for a candidate next token."""
         key = prev_idx * self.vocab_size + cur_idx
         targets = self.trigrams.get(key)
         if targets is None:
@@ -180,7 +170,7 @@ class LLNGraph:
         count = targets.get(next_idx, 0)
         if count > 0:
             return 1.0 + float(np.log1p(count))
-        return 0.7
+        return 0.5
 
     def tokenize(self, text):
         return [self.word_to_idx[w] for w in text.split() if w in self.word_to_idx]
@@ -198,28 +188,25 @@ class LLNGraph:
 # Frozen at T=0 — generated tokens never expand the goal.
 # ═══════════════════════════════════════════════════════════════════
 
-def activate(graph: LLNGraph, prompt_indices: list[int], top_pct: float = 0.20) -> tuple[set[int], dict[int, float]]:
-    """Build semantic field from prompt via direct PMI resonance.
-
-    Each candidate's score = max PMI to any prompt content word.
-    This ensures targets are valued by their strongest singular connection
-    to the prompt, not by generic ubiquity across topics.
-    """
-    # Identify content words in the prompt (skip function word hubs)
-    content_words = [i for i in prompt_indices if graph.in_degree[i] <= 20000]
-
-    # Fallback: if all prompt tokens are function words, use all
-    if not content_words:
-        content_words = list(prompt_indices)
-
-    # Build per-target scores: max PMI across prompt content words
+def activate(graph, prompt_indices, top_pct=0.20):
+    """Build semantic field from prompt via 1-hop PMI."""
     all_pmi = {}
-    for idx in content_words:
+    for idx in prompt_indices:
+        if graph.in_degree[idx] > 20000:
+            continue
         pmi_tgt, pmi_wgt = graph.get_pmi_neighbors(idx)
         for i in range(len(pmi_tgt)):
             t, w = int(pmi_tgt[i]), float(pmi_wgt[i])
             if t not in all_pmi or w > all_pmi[t]:
                 all_pmi[t] = w
+
+    if not all_pmi:
+        for idx in prompt_indices:
+            pmi_tgt, pmi_wgt = graph.get_pmi_neighbors(idx)
+            for i in range(len(pmi_tgt)):
+                t, w = int(pmi_tgt[i]), float(pmi_wgt[i])
+                if t not in all_pmi or w > all_pmi[t]:
+                    all_pmi[t] = w
 
     if not all_pmi:
         return set(prompt_indices), {}
@@ -235,90 +222,16 @@ def activate(graph: LLNGraph, prompt_indices: list[int], top_pct: float = 0.20) 
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Phase 1b — Subnetwork Mass (Contextual Role Classification)
-# "Mass isn't a property of the word, it's a property of the word
-#  IN CONTEXT" — Andy
-# ═══════════════════════════════════════════════════════════════════
-
-def compute_local_mass(graph: LLNGraph, activated: set[int]) -> dict[int, float]:
-    """Compute push/receive ratio for each activated token within the subnetwork.
-
-    For each token, sums outgoing and incoming edge weights that connect
-    to OTHER activated tokens. The ratio Σout_w / (Σin_w + 1) classifies:
-      Sources (>3.0):     push flow forward, initiators
-      Throughput (0.5-3): pass flow, true connectors — valid targets
-      Sinks (<0.5):       absorb flow, structural endpoints — NOT targets
-
-    This replaces hardcoded in_degree thresholds with topology-emergent roles.
-    """
-    activated_arr = np.array(sorted(activated), dtype=np.int32)
-    activated_set = activated  # for O(1) lookup
-
-    out_w = {}  # token -> total outgoing weight within subnet
-    in_w = {}   # token -> total incoming weight within subnet
-
-    for idx in activated_arr:
-        # Scan forward edges, sum weights to activated neighbors
-        s, e = int(graph.full_off[idx]), int(graph.full_off[idx + 1])
-        total_out = 0.0
-        for j in range(s, min(e, s + 500)):
-            tgt = int(graph.full_tgt[j])
-            if tgt in activated_set:
-                w = float(graph.full_wgt[j])
-                total_out += w
-                in_w[tgt] = in_w.get(tgt, 0.0) + w
-        out_w[idx] = total_out
-
-    # Compute push/receive ratio
-    mass = {}
-    for idx in activated_arr:
-        ow = out_w.get(idx, 0.0)
-        iw = in_w.get(idx, 0.0)
-        mass[idx] = ow / (iw + 1.0)
-
-    return mass
-
-
-# ═══════════════════════════════════════════════════════════════════
 # Phase 2 — Target Selection (PMI ∩ Reachability)
 # ═══════════════════════════════════════════════════════════════════
 
-def find_targets(graph: LLNGraph, prompt_indices: list[int], context_indices: list[int],
-                 activated: set[int], pmi_scores: dict[int, float],
-                 local_mass: dict[int, float] | None = None) -> list[tuple[int, float]]:
-    """Find content targets: activated AND reachable in 2-3 hops.
-
-    Direct Semantic Resonance: each target is scored by its strongest
-    direct PMI link to a prompt content word (max, not sum).
-
-    Local Mass Filter: targets must have push/receive ratio >= 0.5
-    (source or throughput in the local subnetwork). Sinks (<0.5) are
-    structural endpoints — they remain traversable but cannot be
-    semantic destinations. This replaces hardcoded in_degree thresholds.
-
-    Dual-anchored reachability explores from both the current walker
-    position and the original prompt nodes.
-    """
+def find_targets(graph, prompt_indices, context_indices, activated, pmi_scores):
+    """Find content targets: activated AND reachable in 2-3 hops."""
     context_set = set(context_indices)
     last = context_indices[-1]
 
-    # Compute direct PMI resonance: for each candidate, what's its
-    # strongest PMI link to a specific prompt content word?
-    content_words = [i for i in prompt_indices if graph.in_degree[i] <= 20000]
-    if not content_words:
-        content_words = list(prompt_indices)
-
-    direct_pmi = {}  # target -> max PMI to any prompt content word
-    for idx in content_words:
-        pmi_tgt, pmi_wgt = graph.get_pmi_neighbors(idx)
-        for i in range(len(pmi_tgt)):
-            t, w = int(pmi_tgt[i]), float(pmi_wgt[i])
-            if t not in direct_pmi or w > direct_pmi[t]:
-                direct_pmi[t] = w
-
-    # Seed reachability from current position AND prompt anchors
+    # Dual-anchored: explore from current position AND prompt nodes
     anchor_nodes = set(prompt_indices) | {last}
-
     reachable = {}
     for anchor in anchor_nodes:
         tgt1, wgt1 = graph.get_forward_edges(anchor, top_k=50)
@@ -347,20 +260,11 @@ def find_targets(graph: LLNGraph, prompt_indices: list[int], context_indices: li
     for t in activated:
         if t in context_set or t not in reachable:
             continue
-        # Local mass filter: sinks (ratio < 0.5) are structural endpoints,
-        # not semantic destinations. Sources and throughput nodes are valid.
-        if local_mass is not None:
-            ratio = local_mass.get(t, 1.0)
-            if ratio < 0.5:
-                continue
-        else:
-            # Fallback: use global in_degree if no local mass available
-            if graph.in_degree[t] > 15000:
-                continue
+        if graph.in_degree[t] > 15000:
+            continue
         hop_dist, _ = reachable[t]
-        # Score by direct PMI resonance to prompt, not pool membership
-        resonance = direct_pmi.get(t, 0)
-        score = resonance * (4 - hop_dist)
+        pmi_score = pmi_scores.get(t, 0)
+        score = pmi_score * (4 - hop_dist)
         targets.append((t, score))
 
     targets.sort(key=lambda x: -x[1])
@@ -371,24 +275,17 @@ def find_targets(graph: LLNGraph, prompt_indices: list[int], context_indices: li
 # Phase 3 — Walk (Broca's Area)
 # ═══════════════════════════════════════════════════════════════════
 
-def walk_to_target(graph: LLNGraph, start: int, target: int, target_pmi: float,
-                   visited: dict[int, int], prev_token: int | None = None,
-                   max_steps: int = 6, top_k: int = 50, viz=None) -> list[int]:
+def walk_to_target(graph, start, target, target_pmi, visited,
+                   prev_token=None, max_steps=6, top_k=50):
     """Walk from start toward target using full graph topology.
 
-    Score = (norm_w × tri_mult) × (1 + proximity × target_PMI)
-    Grammar gates semantics: strong trigrams amplify semantic pull,
-    but dead grammar bridges block it regardless of PMI strength.
+    Score = (normalized_weight x trigram_multiplier) + (proximity x target_PMI)
     """
     ts = int(graph.full_off[target])
     te = int(graph.full_off[target + 1])
     target_out = set()
     for i in range(ts, min(te, ts + 500)):
-        t_out = int(graph.full_tgt[i])
-        # Exclude hub nodes from overlap — punctuation and function words
-        # point to everything, creating false proximity signals.
-        if graph.in_degree[t_out] <= 20000:
-            target_out.add(t_out)
+        target_out.add(int(graph.full_tgt[i]))
 
     path = []
     current = start
@@ -408,8 +305,6 @@ def walk_to_target(graph: LLNGraph, start: int, target: int, target_pmi: float,
         # Direct hit?
         for i in range(len(tgt)):
             if int(tgt[i]) == target:
-                if viz:
-                    viz.record_walk_probe(current, [target], [100.0], target)
                 path.append(target)
                 return path
 
@@ -417,9 +312,6 @@ def walk_to_target(graph: LLNGraph, start: int, target: int, target_pmi: float,
         log_max = max(float(np.log1p(max_w)), 1e-6)
 
         best_t, best_score = -1, -999.0
-        all_candidates = []
-        all_scores = []
-
         for i in range(len(tgt)):
             t = int(tgt[i])
             w = float(wgt[i])
@@ -434,20 +326,15 @@ def walk_to_target(graph: LLNGraph, start: int, target: int, target_pmi: float,
                 if int(graph.fwd_tgt[j]) == target:
                     proximity = 3.0
                     break
-            if proximity == 0.0:
+            if proximity == 0:
                 n_tgts = set()
                 for j in range(ns, min(ne, ns + 100)):
-                    nt = int(graph.fwd_tgt[j])
-                    if graph.in_degree[nt] <= 20000:
-                        n_tgts.add(nt)
+                    n_tgts.add(int(graph.fwd_tgt[j]))
                 overlap = len(n_tgts & target_out)
                 if overlap > 0:
                     proximity = min(overlap * 0.3, 2.0)
 
-            # Multiplicative: grammar (Broca) gates semantics (Wernicke).
-            # Semantic pull amplifies valid grammar paths but cannot
-            # force the walker across a grammatically dead bridge.
-            score = (norm_w * tri_mult) * (1.0 + proximity * target_pmi)
+            score = (norm_w * tri_mult) + (proximity * target_pmi)
 
             visits = visited.get(t, 0)
             if visits >= 3:
@@ -455,16 +342,9 @@ def walk_to_target(graph: LLNGraph, start: int, target: int, target_pmi: float,
             elif visits > 0:
                 score -= 0.3 * visits
 
-            all_candidates.append(t)
-            all_scores.append(score)
-
             if score > best_score:
                 best_score = score
                 best_t = t
-
-        # Record probe event — all candidates the walker considered
-        if viz and all_candidates:
-            viz.record_walk_probe(current, all_candidates, all_scores, best_t)
 
         if best_t < 0 or best_score < -5:
             break
@@ -480,43 +360,19 @@ def walk_to_target(graph: LLNGraph, start: int, target: int, target_pmi: float,
 # Generate
 # ═══════════════════════════════════════════════════════════════════
 
-def generate(graph: LLNGraph, prompt_text: str, max_tokens: int = 20,
-             max_chains: int = 15, verbose: bool = False, viz=None) -> dict:
+def generate(graph, prompt_text, max_tokens=20, max_chains=15, verbose=False):
     """Generate text from a prompt.
 
     Activate -> walk -> deplete -> re-target -> walk -> halt.
-    Pass viz=LLNVisualizer instance to record visualization events.
     """
     prompt_indices = graph.tokenize(prompt_text)
     if not prompt_indices:
         return {'text': prompt_text, 'generated_text': '', 'targets_reached_words': []}
 
-    if viz:
-        viz.record_prompt(prompt_text, prompt_indices)
-
-    # Fix 1: Widen activation for short prompts (≤3 content words)
+    # Widen activation for short prompts (≤3 content words)
     content_words = [i for i in prompt_indices if graph.in_degree[i] <= 20000]
     top_pct = 0.40 if len(content_words) <= 3 else 0.20
-
     activated, pmi_scores = activate(graph, prompt_indices, top_pct=top_pct)
-
-    # Phase 1b: Compute local mass — contextual role classification
-    # Replaces hardcoded in_degree thresholds with topology-emergent roles
-    local_mass = compute_local_mass(graph, activated)
-
-    if viz:
-        # Compute reachable set for layout before recording activation
-        last = prompt_indices[-1]
-        _reach = set()
-        _t1, _ = graph.get_forward_edges(last, top_k=50)
-        for i in range(len(_t1)):
-            _reach.add(int(_t1[i]))
-        for t1 in list(_reach):
-            _t2, _ = graph.get_forward_edges(t1, top_k=30)
-            for i in range(len(_t2)):
-                _reach.add(int(_t2[i]))
-        viz.record_activation(prompt_indices, activated, pmi_scores)
-        viz.record_reachable(_reach)
 
     generated = []
     visited = {t: 1 for t in prompt_indices}
@@ -530,20 +386,16 @@ def generate(graph: LLNGraph, prompt_text: str, max_tokens: int = 20,
             break
 
         context = list(prompt_indices) + generated
-        targets = find_targets(graph, prompt_indices, context, activated, pmi_scores,
-                               local_mass=local_mass)
+        targets = find_targets(graph, prompt_indices, context, activated, pmi_scores)
         targets = [(t, s) for t, s in targets if t not in depleted and t not in visited]
 
         if not targets:
             if verbose:
                 print(f"  [halt: semantic field exhausted after {len(generated)} tokens]")
-            if viz:
-                viz.record_halt('semantic field exhausted', generated)
             break
 
-        # Fix 3: Hyperbolic depth decay (synaptic fatigue)
-        # Later chains require increasingly strong PMI to fire.
-        # score *= 1/(1 + 0.15*chain) — halves at chain ~7, never reaches zero.
+        # Synaptic fatigue: later chains require stronger PMI to fire.
+        # Hyperbolic decay — halves at chain ~7, never reaches zero.
         fatigue = 1.0 / (1.0 + 0.15 * chain)
         targets = [(t, s * fatigue) for t, s in targets]
         targets.sort(key=lambda x: -x[1])
@@ -551,15 +403,11 @@ def generate(graph: LLNGraph, prompt_text: str, max_tokens: int = 20,
         dest_idx, dest_score = targets[0]
 
         if verbose:
-            mass_ratio = local_mass.get(dest_idx, -1)
             print(f"  chain {chain}: target={graph.idx_to_word[dest_idx]} "
-                  f"(PMI={dest_score:.2f}, mass={mass_ratio:.2f}, fatigue={fatigue:.2f}, {len(targets)} remaining)")
-
-        if viz:
-            viz.record_target_select(dest_idx, dest_score, len(targets))
+                  f"(PMI={dest_score:.2f}, fatigue={fatigue:.2f}, {len(targets)} remaining)")
 
         path = walk_to_target(graph, current, dest_idx, dest_score, visited,
-                              prev_token=prev_token, max_steps=8, viz=viz)
+                              prev_token=prev_token, max_steps=6)
 
         reached = len(path) > 0 and path[-1] == dest_idx
 
@@ -567,34 +415,21 @@ def generate(graph: LLNGraph, prompt_text: str, max_tokens: int = 20,
             depleted.add(dest_idx)
             if verbose:
                 print(f"    missed (organic pruning)")
-            if viz:
-                viz.record_target_missed(dest_idx)
             continue
 
-        # Record each walk step for visualization
-        walk_prev = current
-        for step_i, t in enumerate(path):
+        for t in path:
             if len(generated) >= max_tokens:
                 break
-            if viz:
-                viz.record_walk_step(walk_prev, t, step_i)
             generated.append(t)
             visited[t] = visited.get(t, 0) + 1
             prev_token = current
             current = t
-            walk_prev = t
 
         targets_reached.append(dest_idx)
         depleted.add(dest_idx)
 
-        if viz:
-            viz.record_target_reached(dest_idx, path)
-
         if verbose:
             print(f"    reached: {graph.detokenize(path)}")
-
-    if viz and (len(generated) >= max_tokens):
-        viz.record_halt('max tokens reached', generated)
 
     return {
         'text': graph.detokenize(prompt_indices + generated),
@@ -638,10 +473,6 @@ def main():
                         help="Maximum tokens to generate")
     parser.add_argument("--verbose", action="store_true",
                         help="Show target selection details")
-    parser.add_argument("--visualize", action="store_true",
-                        help="Real-time graph visualization during inference")
-    parser.add_argument("--viz-speed", type=int, default=600,
-                        help="Visualization speed in ms per event (default: 600)")
     args = parser.parse_args()
 
     # Resolve model path
@@ -659,19 +490,11 @@ def main():
           f"PMI: {len(graph.pmi_tgt):,} | Trigrams: {len(graph.trigrams):,}")
     print()
 
-    # Initialize visualizer if requested
-    viz = None
-    if args.visualize:
-        from lln_visualize import LLNVisualizer
-        viz = LLNVisualizer(graph)
-        print("  Visualization enabled — window will open after generation\n")
-
     prompts = [args.prompt] if args.prompt else DEFAULT_PROMPTS
 
     for prompt in prompts:
         t0 = time.time()
-        result = generate(graph, prompt, max_tokens=args.max_tokens,
-                         verbose=args.verbose, viz=viz)
+        result = generate(graph, prompt, max_tokens=args.max_tokens, verbose=args.verbose)
         gen_time = time.time() - t0
 
         print(f"  \"{prompt}\"")
@@ -679,14 +502,6 @@ def main():
         print(f"     [{result['n_generated']} tokens, {result['targets_reached']} targets, "
               f"{gen_time:.3f}s]")
         print()
-
-        # Play visualization for this prompt
-        if viz:
-            print("  Opening visualization...")
-            viz.play(interval_ms=args.viz_speed)
-            # Reset for next prompt if multiple
-            if len(prompts) > 1:
-                viz = LLNVisualizer(graph)
 
     graph.close()
 
