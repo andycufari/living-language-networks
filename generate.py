@@ -235,17 +235,66 @@ def activate(graph: LLNGraph, prompt_indices: list[int], top_pct: float = 0.20) 
 
 
 # ═══════════════════════════════════════════════════════════════════
+# Phase 1b — Subnetwork Mass (Contextual Role Classification)
+# "Mass isn't a property of the word, it's a property of the word
+#  IN CONTEXT" — Andy
+# ═══════════════════════════════════════════════════════════════════
+
+def compute_local_mass(graph: LLNGraph, activated: set[int]) -> dict[int, float]:
+    """Compute push/receive ratio for each activated token within the subnetwork.
+
+    For each token, sums outgoing and incoming edge weights that connect
+    to OTHER activated tokens. The ratio Σout_w / (Σin_w + 1) classifies:
+      Sources (>3.0):     push flow forward, initiators
+      Throughput (0.5-3): pass flow, true connectors — valid targets
+      Sinks (<0.5):       absorb flow, structural endpoints — NOT targets
+
+    This replaces hardcoded in_degree thresholds with topology-emergent roles.
+    """
+    activated_arr = np.array(sorted(activated), dtype=np.int32)
+    activated_set = activated  # for O(1) lookup
+
+    out_w = {}  # token -> total outgoing weight within subnet
+    in_w = {}   # token -> total incoming weight within subnet
+
+    for idx in activated_arr:
+        # Scan forward edges, sum weights to activated neighbors
+        s, e = int(graph.full_off[idx]), int(graph.full_off[idx + 1])
+        total_out = 0.0
+        for j in range(s, min(e, s + 500)):
+            tgt = int(graph.full_tgt[j])
+            if tgt in activated_set:
+                w = float(graph.full_wgt[j])
+                total_out += w
+                in_w[tgt] = in_w.get(tgt, 0.0) + w
+        out_w[idx] = total_out
+
+    # Compute push/receive ratio
+    mass = {}
+    for idx in activated_arr:
+        ow = out_w.get(idx, 0.0)
+        iw = in_w.get(idx, 0.0)
+        mass[idx] = ow / (iw + 1.0)
+
+    return mass
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Phase 2 — Target Selection (PMI ∩ Reachability)
 # ═══════════════════════════════════════════════════════════════════
 
 def find_targets(graph: LLNGraph, prompt_indices: list[int], context_indices: list[int],
-                 activated: set[int], pmi_scores: dict[int, float]) -> list[tuple[int, float]]:
+                 activated: set[int], pmi_scores: dict[int, float],
+                 local_mass: dict[int, float] | None = None) -> list[tuple[int, float]]:
     """Find content targets: activated AND reachable in 2-3 hops.
 
     Direct Semantic Resonance: each target is scored by its strongest
-    direct PMI link to a prompt content word (max, not sum). This makes
-    "brightly" (profound link to "fire") outrank "result" (mediocre link
-    to everything).
+    direct PMI link to a prompt content word (max, not sum).
+
+    Local Mass Filter: targets must have push/receive ratio >= 0.5
+    (source or throughput in the local subnetwork). Sinks (<0.5) are
+    structural endpoints — they remain traversable but cannot be
+    semantic destinations. This replaces hardcoded in_degree thresholds.
 
     Dual-anchored reachability explores from both the current walker
     position and the original prompt nodes.
@@ -298,8 +347,16 @@ def find_targets(graph: LLNGraph, prompt_indices: list[int], context_indices: li
     for t in activated:
         if t in context_set or t not in reachable:
             continue
-        if graph.in_degree[t] > 15000:
-            continue
+        # Local mass filter: sinks (ratio < 0.5) are structural endpoints,
+        # not semantic destinations. Sources and throughput nodes are valid.
+        if local_mass is not None:
+            ratio = local_mass.get(t, 1.0)
+            if ratio < 0.5:
+                continue
+        else:
+            # Fallback: use global in_degree if no local mass available
+            if graph.in_degree[t] > 15000:
+                continue
         hop_dist, _ = reachable[t]
         # Score by direct PMI resonance to prompt, not pool membership
         resonance = direct_pmi.get(t, 0)
@@ -443,6 +500,10 @@ def generate(graph: LLNGraph, prompt_text: str, max_tokens: int = 20,
 
     activated, pmi_scores = activate(graph, prompt_indices, top_pct=top_pct)
 
+    # Phase 1b: Compute local mass — contextual role classification
+    # Replaces hardcoded in_degree thresholds with topology-emergent roles
+    local_mass = compute_local_mass(graph, activated)
+
     if viz:
         # Compute reachable set for layout before recording activation
         last = prompt_indices[-1]
@@ -469,7 +530,8 @@ def generate(graph: LLNGraph, prompt_text: str, max_tokens: int = 20,
             break
 
         context = list(prompt_indices) + generated
-        targets = find_targets(graph, prompt_indices, context, activated, pmi_scores)
+        targets = find_targets(graph, prompt_indices, context, activated, pmi_scores,
+                               local_mass=local_mass)
         targets = [(t, s) for t, s in targets if t not in depleted and t not in visited]
 
         if not targets:
@@ -489,8 +551,9 @@ def generate(graph: LLNGraph, prompt_text: str, max_tokens: int = 20,
         dest_idx, dest_score = targets[0]
 
         if verbose:
+            mass_ratio = local_mass.get(dest_idx, -1)
             print(f"  chain {chain}: target={graph.idx_to_word[dest_idx]} "
-                  f"(PMI={dest_score:.2f}, fatigue={fatigue:.2f}, {len(targets)} remaining)")
+                  f"(PMI={dest_score:.2f}, mass={mass_ratio:.2f}, fatigue={fatigue:.2f}, {len(targets)} remaining)")
 
         if viz:
             viz.record_target_select(dest_idx, dest_score, len(targets))
