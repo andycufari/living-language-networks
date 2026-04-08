@@ -162,7 +162,12 @@ class LLNGraph:
         return self.pmi_tgt[s:e], self.pmi_wgt[s:e]
 
     def trigram_score(self, prev_idx, cur_idx, next_idx):
-        """Trigram multiplier from the base graph."""
+        """Trigram multiplier from the base graph.
+
+        If the (prev, cur) pair exists in the trigram index but next_idx
+        was never observed after it, that's a grammar violation: hard 0.1x.
+        If no trigram data exists for this pair, stay neutral (1.0).
+        """
         key = prev_idx * self.vocab_size + cur_idx
         targets = self.trigrams.get(key)
         if targets is None:
@@ -170,7 +175,7 @@ class LLNGraph:
         count = targets.get(next_idx, 0)
         if count > 0:
             return 1.0 + float(np.log1p(count))
-        return 0.5
+        return 0.3
 
     def tokenize(self, text):
         return [self.word_to_idx[w] for w in text.split() if w in self.word_to_idx]
@@ -391,7 +396,10 @@ def walk_to_target(graph, start, target, target_pmi, visited,
                     if overlap > 0:
                         proximity = min(overlap * 0.3, 2.0)
 
-                step_score = (norm_w * tri_mult) + (proximity * target_pmi)
+                # Log-compress target_pmi so pull doesn't drown grammar
+                # Without log: grammar ~3, pull ~75. With log: grammar ~3, pull ~10.
+                pull_strength = float(np.log1p(target_pmi))
+                step_score = (norm_w * tri_mult) + (proximity * pull_strength)
 
                 visits = visited.get(t, 0)
                 if visits >= 3:
@@ -415,7 +423,150 @@ def walk_to_target(graph, start, target, target_pmi, visited,
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Generate
+# Grammar-First Walker with Semantic Fencing
+# ═══════════════════════════════════════════════════════════════════
+
+def generate_fenced(graph, prompt_text, max_tokens=20, verbose=False):
+    """Grammar-first generation with semantic fencing.
+
+    Instead of walking TOWARD semantic targets (pathfinding),
+    walks GRAMMATICALLY within a semantic territory (fenced roaming).
+
+    The semantic field is a fence, not a destination. The walker follows
+    the strongest trigram-weighted paths within the territory. When it
+    lands on an activated content word, it depletes it. When no grammatical
+    path stays inside the fence, it halts.
+    """
+    prompt_indices = graph.tokenize(prompt_text)
+    if not prompt_indices:
+        return {'text': prompt_text, 'generated_text': '', 'n_generated': 0,
+                'content_hits': 0, 'content_words': [], 'activated_size': 0}
+
+    # Phase 1: Activate semantic field (unchanged)
+    content_words = [i for i in prompt_indices if graph.in_degree[i] <= 20000]
+    top_pct = 0.40 if len(content_words) <= 3 else 0.20
+    activated, pmi_scores = activate(graph, prompt_indices, top_pct=top_pct)
+
+    # Build the FENCE: activated words + function words + punctuation
+    # Function words (in_degree > 5000) are grammatical glue, always allowed
+    FUNCTION_THRESHOLD = 5000
+    fence = set(activated)
+    function_words = set()
+    for i in range(graph.vocab_size):
+        if graph.in_degree[i] > FUNCTION_THRESHOLD:
+            fence.add(i)
+            function_words.add(i)
+        word = graph.idx_to_word[i]
+        if word in {'.', ',', ';', ':', '!', '?', '(', ')', '"', '-', "'"}:
+            fence.add(i)
+
+    if verbose:
+        n_content = len(activated) - len([i for i in activated if i in function_words])
+        print(f"  Fence: {len(fence)} total ({n_content} content + "
+              f"{len(function_words)} function words)")
+
+    # Phase 2: Grammar-first walk
+    generated = []
+    current = prompt_indices[-1]
+    prev_token = prompt_indices[-2] if len(prompt_indices) > 1 else None
+    visited_count = {t: 1 for t in prompt_indices}
+    depleted = set()
+    content_hits = []
+    stall_count = 0
+    MAX_STALL = 3
+
+    for step in range(max_tokens):
+        tgt, wgt = graph.get_forward_edges(current, top_k=100)
+        if len(tgt) == 0:
+            if verbose:
+                print(f"  [halt: no forward edges from '{graph.idx_to_word[current]}']")
+            break
+
+        # Score candidates: grammar only, filtered by fence
+        candidates = []
+        for i in range(len(tgt)):
+            t = int(tgt[i])
+            w = float(wgt[i])
+
+            if t not in fence:
+                continue
+            if visited_count.get(t, 0) >= 3:
+                continue
+
+            norm_w = float(np.log1p(w))
+            tri_mult = graph.trigram_score(prev_token, current, t) if prev_token is not None else 1.0
+            score = norm_w * tri_mult
+
+            # Visit penalty
+            v = visited_count.get(t, 0)
+            if v > 0:
+                score *= 0.5 ** v
+
+            # Content boost: prefer on-topic content over function word chains
+            is_content = (t in activated and t not in function_words and t not in depleted)
+            if is_content:
+                pmi = pmi_scores.get(t, 0)
+                score *= (1.0 + float(np.log1p(pmi)) * 0.3)
+
+            candidates.append((t, score))
+
+        if not candidates:
+            stall_count += 1
+            if stall_count >= MAX_STALL:
+                if verbose:
+                    print(f"  [halt: {MAX_STALL} consecutive stalls, fence exhausted]")
+                break
+            # Recovery: allow any grammatical step (temporary fence breach)
+            for i in range(len(tgt)):
+                t = int(tgt[i])
+                w = float(wgt[i])
+                if visited_count.get(t, 0) < 3:
+                    norm_w = float(np.log1p(w))
+                    tri_mult = graph.trigram_score(prev_token, current, t) if prev_token is not None else 1.0
+                    candidates.append((t, norm_w * tri_mult * 0.3))
+            if not candidates:
+                if verbose:
+                    print(f"  [halt: dead end at '{graph.idx_to_word[current]}']")
+                break
+        else:
+            stall_count = 0
+
+        candidates.sort(key=lambda x: -x[1])
+        chosen, chosen_score = candidates[0]
+
+        generated.append(chosen)
+        visited_count[chosen] = visited_count.get(chosen, 0) + 1
+        prev_token = current
+        current = chosen
+
+        is_content = (chosen in activated and
+                      chosen not in function_words and
+                      chosen not in depleted)
+        if is_content:
+            depleted.add(chosen)
+            content_hits.append(chosen)
+
+        if verbose:
+            word = graph.idx_to_word[chosen]
+            marker = " * CONTENT" if is_content else ""
+            if stall_count > 0:
+                marker += " [breach]"
+            print(f"  step {step:2d}: {word:15s} (score={chosen_score:.2f}){marker}")
+
+    return {
+        'text': graph.detokenize(prompt_indices + generated),
+        'prompt': prompt_text,
+        'generated_text': graph.detokenize(generated),
+        'n_generated': len(generated),
+        'content_hits': len(content_hits),
+        'content_words': [graph.idx_to_word[t] for t in content_hits],
+        'activated_size': len(activated),
+        'fence_size': len(fence),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Target-Driven Generate (original architecture)
 # ═══════════════════════════════════════════════════════════════════
 
 def generate(graph, prompt_text, max_tokens=20, max_chains=15, verbose=False):
@@ -541,6 +692,10 @@ def main():
                         help="Maximum tokens to generate")
     parser.add_argument("--verbose", action="store_true",
                         help="Show target selection details")
+    parser.add_argument("--interactive", action="store_true",
+                        help="Interactive mode: load model once, prompt repeatedly")
+    parser.add_argument("--fenced", action="store_true",
+                        help="Grammar-first walker with semantic fencing (experimental)")
     args = parser.parse_args()
 
     # Resolve model path
@@ -558,18 +713,45 @@ def main():
           f"PMI: {len(graph.pmi_tgt):,} | Trigrams: {len(graph.trigrams):,}")
     print()
 
-    prompts = [args.prompt] if args.prompt else DEFAULT_PROMPTS
+    gen_fn = generate_fenced if args.fenced else generate
 
-    for prompt in prompts:
-        t0 = time.time()
-        result = generate(graph, prompt, max_tokens=args.max_tokens, verbose=args.verbose)
-        gen_time = time.time() - t0
+    if args.interactive:
+        mode = "fenced" if args.fenced else "target-driven"
+        print(f"Interactive mode ({mode}). Type a prompt, or 'quit' to exit.\n")
+        while True:
+            try:
+                prompt = input(">>> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\nBye.")
+                break
+            if not prompt or prompt.lower() in ("quit", "exit", "q"):
+                if prompt.lower() in ("quit", "exit", "q"):
+                    print("Bye.")
+                break
+            t0 = time.time()
+            result = gen_fn(graph, prompt, max_tokens=args.max_tokens, verbose=args.verbose)
+            gen_time = time.time() - t0
+            print(f"  -> {result['generated_text']}")
+            hits = result.get('content_hits', result.get('targets_reached', 0))
+            print(f"     [{result['n_generated']} tokens, {hits} hits, {gen_time:.3f}s]")
+            if args.fenced and result.get('content_words'):
+                print(f"     content: {', '.join(result['content_words'])}")
+            print()
+    else:
+        prompts = [args.prompt] if args.prompt else DEFAULT_PROMPTS
 
-        print(f"  \"{prompt}\"")
-        print(f"  -> {result['generated_text']}")
-        print(f"     [{result['n_generated']} tokens, {result['targets_reached']} targets, "
-              f"{gen_time:.3f}s]")
-        print()
+        for prompt in prompts:
+            t0 = time.time()
+            result = gen_fn(graph, prompt, max_tokens=args.max_tokens, verbose=args.verbose)
+            gen_time = time.time() - t0
+
+            print(f"  \"{prompt}\"")
+            print(f"  -> {result['generated_text']}")
+            hits = result.get('content_hits', result.get('targets_reached', 0))
+            print(f"     [{result['n_generated']} tokens, {hits} hits, {gen_time:.3f}s]")
+            if args.fenced and result.get('content_words'):
+                print(f"     content: {', '.join(result['content_words'])}")
+            print()
 
     graph.close()
 
