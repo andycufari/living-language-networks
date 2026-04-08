@@ -1,9 +1,9 @@
 # LLN: Living Language Network
 
-**Zero-parameter language generation from pure graph topology. With live learning.**
+**Zero-parameter language generation from pure graph topology.**
 
 No neural networks. No gradient descent. No learned weights.
-A directed weighted graph, a PMI activation field, a biologically-inspired walker, and an episodic memory that learns in real time.
+A directed weighted graph, a PMI activation field, and a biologically-inspired walker.
 
 ```bash
 pip install numpy lmdb huggingface_hub
@@ -24,9 +24,8 @@ Generation works like the brain's language system:
 1. **Activate** (Wernicke) Frequency-penalized PMI finds content word targets (WHAT to talk about)
 2. **Route** Flow-aware target selection avoids topological dead ends (WHERE to aim)
 3. **Walk** (Broca) Beam search across competing paths builds the grammar bridge (HOW to get there)
-4. **Remember** (Hippocampus) A Delta Graph overlay provides O(1) short-term episodic memory, allowing real-time learning that overrides base habits
-5. **Deplete** Hit a target, zero its activation, landscape shifts to next peak
-6. **Halt** Semantic field exhausted, stop naturally
+4. **Deplete** Hit a target, zero its activation, landscape shifts to next peak
+5. **Halt** Semantic field exhausted, stop naturally
 
 Every decision is traceable. You can see exactly why each word was chosen.
 
@@ -88,59 +87,6 @@ Every target, every hit, every miss, every halt reason is visible. The `PR` tag 
 
 ---
 
-## Live Learning: Zero-Gradient O(1) Memory
-
-LLN features an episodic memory overlay (a "Delta Graph"). It can learn new facts instantly without backpropagation, and route through them without catastrophic forgetting of the base graph.
-
-```bash
-python living.py
-```
-
-```
->>> GENERATE: The terrifying monster
-  chain 0: target=ordeal (PMI=30.44, PR=0.14 [SINK])     → missed
-  chain 1: target=truck (PMI=24.18, PR=0.05 [SINK])      → reached: truck
-  ...
-  → truck . One important aspect of these little fellow creatures
-  (Base graph only. No knowledge of space monsters)
-
->>> LEARN: The glorflax is a terrifying space monster that lurks behind dark nebula clouds
-  Learned 12 bigrams
-  Content words linked: monster, terrifying, space, lurks, nebula, clouds, dark, prey
-
->>> GENERATE: The terrifying monster
-  chain 0: target=lurks (PMI=3220.98, PR=0.23 [SINK])    → reached: lurks
-  ...
-  → lurks behind every aspect of these little fellow creatures
-  (Delta Graph routes through "lurks behind", learned 0.01s ago!)
-
->>> FORGET
-  Short-term memory cleared.
-
->>> GENERATE: The terrifying monster
-  → truck . One important aspect of these little fellow creatures
-  (Back to base graph. Zero catastrophic forgetting.)
-```
-
-The base graph (117.5M edges from 32GB of text) acts as **semantic memory**: deep, slow, permanent. The Delta Graph acts as **episodic memory**: fast, volatile, overriding. Just like the hippocampus overrides cortical habits with recent experience.
-
-**Try it yourself:**
-
-```bash
-python living.py
-
-# Teach it something it doesn't know
->>> LEARN: The purple elephant danced gracefully through the moonlit garden
-
-# Now generate (it routes through the learned edges)
->>> GENERATE: The purple elephant
-
-# Clear memory (back to base behavior)
->>> FORGET
-```
-
----
-
 ## The Model
 
 | Property | Value |
@@ -174,9 +120,6 @@ python generate.py --prompt "The king ruled"
 
 # With verbose tracing
 python generate.py --prompt "The ship sailed" --verbose
-
-# Interactive live learning mode
-python living.py
 
 # Custom model
 python generate.py --model path/to/your/model.lmdb --prompt "Hello world"
@@ -239,7 +182,7 @@ No GPU needed. The chunked trainer processes arbitrarily large corpora on machin
 - Grammar quality is below GPT-2. LLN wins on topic, not on syntax
 - Some corpus artifacts leak through (OpenWebText HTML fragments, Gutenberg archaisms)
 - Sink-dominated prompts (volcano/eruption) still produce shorter output
-- Live learning requires in-vocab words (OOV words like "glorflax" are skipped)
+
 
 ---
 

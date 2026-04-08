@@ -7,13 +7,13 @@
 
 ## Abstract
 
-We present Living Language Networks (LLN), a language generation system that uses zero learned parameters. Instead of gradient descent over millions of weights, LLN builds a directed weighted graph from raw text co-occurrence counts and generates language by routing activation through the graph's topology. The system includes an episodic memory overlay that enables real-time learning without gradient updates — new facts are absorbed in O(1) time and immediately influence generation, with zero catastrophic forgetting of the base graph.
+We present Living Language Networks (LLN), a language generation system that uses zero learned parameters. Instead of gradient descent over millions of weights, LLN builds a directed weighted graph from raw text co-occurrence counts and generates language by routing activation through the graph's topology.
 
 On a 40-prompt benchmark against a 17.7M-parameter GPT-2 model trained on the same corpus, LLN achieves **75% win rate** on topical relevance (0.510 vs 0.225), **76.1% content word ratio** (vs 45.6%), and **91.7% vocabulary diversity** (vs 65.5%) — while producing zero degenerate outputs.
 
 The current model (v16) is trained on a 32GB blend of three corpora — FineWeb-Edu, Project Gutenberg, and OpenWebText — producing a graph with 117.5 million forward edges, 34.5 million PMI semantic associations, and 11.9 million trigram pairs. The model builds in approximately 3 hours on an 8-core CPU. Generation takes ~0.3-0.6 seconds per prompt. No GPU is required at any stage.
 
-The architecture introduces six mechanisms that solve long-standing problems in unconstrained graph walks: **frequency-penalized PMI activation** prevents rare-word hallucination, **flow-aware target selection** avoids topological dead ends, **beam search path competition** finds grammatical bridges across low-weight gaps, **episodic override** enables real-time learning via a Delta Graph overlay, **target depletion** eliminates Markovian drift, and **anchored activation** prevents the semantic field from expanding beyond the original prompt. Together, these produce a system where sentence length emerges naturally from the topology — generation halts when semantic energy is exhausted, without a hardcoded maximum.
+The architecture introduces five mechanisms that solve long-standing problems in unconstrained graph walks: **frequency-penalized PMI activation** prevents rare-word hallucination, **flow-aware target selection** avoids topological dead ends, **beam search path competition** finds grammatical bridges across low-weight gaps, **target depletion** eliminates Markovian drift, and **anchored activation** prevents the semantic field from expanding beyond the original prompt. Together, these produce a system where sentence length emerges naturally from the topology — generation halts when semantic energy is exhausted, without a hardcoded maximum.
 
 Every generation step is fully traceable: which targets were selected, which were reached, which were organically pruned, and why the system halted. The model is a glass box.
 
@@ -60,8 +60,6 @@ LLN explicitly separates these two functions.
 **Phase 2 (Routing)**: A flow-aware targeting system classifies the local topology into sources, throughputs, and sinks — dynamically routing the walker toward nodes that can sustain forward momentum.
 
 **Phase 3 (Broca)**: A beam search walker evaluates multiple competing grammatical paths in parallel, finding bridges across low-weight topological gaps that a greedy walker would miss.
-
-**Phase 4 (Hippocampus)**: An in-memory Delta Graph provides episodic memory — recently learned facts override long-term habits through massive weight multipliers, just as the hippocampus overrides cortical patterns with recent experience.
 
 This separation is the core architectural insight. Each system operates on different representations, at different timescales, with different objectives — and each maps to a distinct neural subsystem.
 
@@ -243,39 +241,6 @@ chain 14: target=cheeks (PMI=7.96, 71 remaining)         → reached: cheeks
 
 For every token, you can identify: which target it was walking toward, what score justified the walk, and whether the target was reached or pruned.
 
-### 4.7 Episodic Override (The Hippocampus)
-
-The LMDB CSR arrays that store the base graph are immutable at inference time — 117.5 million edges frozen in Compressed Sparse Row format. This is the system's **semantic memory**: deep, slow to build, permanent.
-
-LLN introduces a **Delta Graph** — an in-memory overlay of Python dictionaries that stores learned bigrams, trigrams, and PMI associations. This is the system's **episodic memory**: instant to write, volatile (cleared on session end or explicit `FORGET`), and capable of overriding the base graph.
-
-The mechanism works through three interventions:
-
-1. **Edge injection**: `graph.learn("The monster lurks behind dark nebula clouds")` extracts bigrams (monster→lurks, lurks→behind, behind→dark, ...) and stores them with weight 5,000 — roughly equal to a word appearing 5,000 times in the training corpus. When `get_forward_edges()` is called, it merges CSR edges with delta edges before selecting the top-K. The learned edge `monster→lurks` (w=5,000) now competes with base edges like `monster→,` (w=9,409) and `monster→in` (w=3,806).
-
-2. **PMI injection**: All content words in the learned sentence are cross-linked with PMI weight 15.0. This means Wernicke's activation field will discover "lurks", "nebula", "clouds" when the prompt contains "monster" — even though these associations don't exist in the base PMI graph.
-
-3. **Episodic priority**: In target selection, if any anchor node has a delta edge to a candidate target, that target's score is multiplied by 10x. This ensures learned targets fire first — before the walker moves away from the edge's source and loses the bridge.
-
-4. **Walker override**: In the beam search, candidates reached via delta edges receive a +50 flat bonus to their step score. Delta trigram sequences return a 50x multiplier (vs 1-3x for base trigrams). Together, these ensure the beam search follows the learned path rather than drifting into the base graph's gravitational field.
-
-The result is O(1) learning with immediate inference impact:
-
-```
-BEFORE learning:
-  "The terrifying monster" → truck . One important aspect of these little fellow creatures
-
-LEARN: "A terrifying space monster lurks behind dark nebula clouds"
-
-AFTER learning:
-  "The terrifying monster" → lurks behind every aspect of these little fellow creatures
-
-FORGET:
-  "The terrifying monster" → truck . One important aspect of these little fellow creatures
-```
-
-The base graph is never modified. Learning is additive. Forgetting is a dictionary clear. This is fundamentally different from neural network fine-tuning, where updating weights to learn new information risks catastrophic forgetting of existing knowledge. In LLN, the two memory systems are structurally separate — the hippocampus cannot corrupt the cortex.
-
 ---
 
 ## 5. Benchmark Results
@@ -348,13 +313,11 @@ LLN never produces degenerate output. It either generates semantically justified
 
 **Hybrid architecture**: The most promising direction is using LLN as a semantic pre-processor for a small transformer. LLN would provide a topologically-validated word cloud — the content targets, in order, with connector positions marked — and a lightweight language model would format this into syntactically correct English.
 
-**Persistent live learning**: The current Delta Graph is volatile — it lives in RAM and is lost when the session ends. Persisting learned edges back to LMDB (with a separate "episode" database) would enable long-term incremental learning while preserving the structural separation between base and episodic memory.
-
-**Full subnetwork mass**: The current flow-aware routing uses a fast proxy (out_degree / in_degree). Our research (TOPOLOGY_DEBUG_V16.md) shows that computing full local weight sums within the activated subnetwork reveals much richer role information — "the" shifts from a balanced node globally to a weight black hole in military context. Integrating full subnetwork mass computation into the walker could enable truly context-aware grammatical routing.
+**Full subnetwork mass**: The current flow-aware routing uses a fast proxy (out_degree / in_degree). Our research shows that computing full local weight sums within the activated subnetwork reveals much richer role information — "the" shifts from a balanced node globally to a weight black hole in military context. Integrating full subnetwork mass computation into the walker could enable truly context-aware grammatical routing.
 
 **Multi-hop PMI propagation**: Current activation uses 1-hop PMI from prompt words. Propagating activation through 2-3 PMI hops (with appropriate decay) would produce richer semantic fields for short prompts while maintaining precision.
 
-**Vocabulary expansion**: The current Delta Graph can only learn edges between existing vocabulary tokens. Words not in the 100K vocabulary (like "glorflax") are silently dropped. Dynamic vocabulary expansion — assigning temporary indices to novel tokens and wiring them into the delta graph — would enable truly open-ended learning.
+**Live learning**: The immutable graph could be augmented with an in-memory overlay (a "Delta Graph") to enable real-time learning without modifying the base model. Learned edges would compete with frozen edges, enabling O(1) fact absorption without catastrophic forgetting.
 
 ---
 
@@ -362,7 +325,7 @@ LLN never produces degenerate output. It either generates semantically justified
 
 LLN demonstrates that topical language generation does not require learned parameters. A directed weighted graph, built from raw co-occurrence statistics in hours on a CPU, can outperform a neural network with 17.7 million learned weights on the task of producing topically relevant output.
 
-The key insight is architectural: by separating semantic routing (PMI activation) from grammatical execution (beam search walking), by implementing biologically-inspired mechanisms like synaptic depression (target depletion) and executive attention (PMI-modulated proximity), by using topological analysis to dynamically classify the landscape (flow-aware routing), and by providing an episodic memory system that enables O(1) learning without catastrophic forgetting, we achieve coherent multi-step generation without the amnesia of Markov chains or the opacity of transformers.
+The key insight is architectural: by separating semantic routing (PMI activation) from grammatical execution (beam search walking), by implementing biologically-inspired mechanisms like synaptic depression (target depletion) and executive attention (PMI-modulated proximity), and by using topological analysis to dynamically classify the landscape (flow-aware routing), we achieve coherent multi-step generation without the amnesia of Markov chains or the opacity of transformers.
 
 The model is a glass box. Every decision is traceable. Every output is justified by observable graph structure. When the system has nothing meaningful to say, it stops.
 
