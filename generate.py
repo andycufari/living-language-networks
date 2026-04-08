@@ -120,6 +120,14 @@ class LLNGraph:
             minlength=self.vocab_size
         ).astype(np.int32)
 
+        # Delta Graph — short-term memory overlay (Live Learning)
+        # delta_fwd[src_idx] = {tgt_idx: weight, ...}
+        self.delta_fwd = {}
+        # delta_tri[(prev_idx, cur_idx)] = {next_idx: count, ...}
+        self.delta_tri = {}
+        # delta_pmi[src_idx] = {tgt_idx: weight, ...}  (injected semantic links)
+        self.delta_pmi = {}
+
     def _load_trigrams(self, txn):
         """Load trigram index: (prev, cur) -> {next: count}."""
         tri_data = txn.get(b'trigrams_v2')
@@ -142,26 +150,141 @@ class LLNGraph:
             index[key] = targets
         return index
 
+    def learn(self, text, weight=5000.0):
+        """Live Learning: absorb text into the delta graph (short-term memory).
+
+        Extracts bigrams and trigrams from the input text and stores them
+        with a massive weight so they overpower the background corpus.
+        Also injects PMI-like links between all content words in the text
+        so Wernicke's activation can find them.
+        """
+        import re
+        words = re.findall(r"[a-zA-Z]+(?:'[a-zA-Z]+)?|[.,;:!?()\"'-]", text)
+        indices = []
+        oov = []
+        for w in words:
+            if w in self.word_to_idx:
+                indices.append(self.word_to_idx[w])
+            else:
+                oov.append(w)
+
+        if len(indices) < 2:
+            return {'learned': 0, 'oov': oov}
+
+        # Bigrams → delta_fwd
+        for i in range(len(indices) - 1):
+            src, tgt = indices[i], indices[i + 1]
+            if src not in self.delta_fwd:
+                self.delta_fwd[src] = {}
+            self.delta_fwd[src][tgt] = self.delta_fwd[src].get(tgt, 0) + weight
+
+        # Trigrams → delta_tri
+        for i in range(len(indices) - 2):
+            prev, cur, nxt = indices[i], indices[i + 1], indices[i + 2]
+            key = (prev, cur)
+            if key not in self.delta_tri:
+                self.delta_tri[key] = {}
+            self.delta_tri[key][nxt] = self.delta_tri[key].get(nxt, 0) + weight
+
+        # PMI injection: all content words in the sentence link to each other
+        # so Wernicke's activation can discover them from any prompt word
+        content = [idx for idx in set(indices) if self.in_degree[idx] <= 20000]
+        pmi_weight = 15.0  # strong but not overwhelming
+        for i in range(len(content)):
+            for j in range(len(content)):
+                if i == j:
+                    continue
+                src, tgt = content[i], content[j]
+                if src not in self.delta_pmi:
+                    self.delta_pmi[src] = {}
+                if tgt not in self.delta_pmi[src] or self.delta_pmi[src][tgt] < pmi_weight:
+                    self.delta_pmi[src][tgt] = pmi_weight
+
+        return {
+            'learned': len(indices) - 1,
+            'oov': oov,
+            'content_words': [self.idx_to_word[i] for i in content],
+        }
+
     def get_forward_edges(self, idx, top_k=50):
-        """Top-K forward edges by weight. Returns (targets, weights)."""
+        """Top-K forward edges by weight, merged with delta graph."""
         s, e = int(self.fwd_off[idx]), int(self.fwd_off[idx + 1])
-        if s == e:
+        if s == e and idx not in self.delta_fwd:
             return np.array([], np.int32), np.array([], np.float32)
-        tgt, wgt = self.fwd_tgt[s:e], self.fwd_wgt[s:e]
+
+        # Start with CSR edges
+        if s < e:
+            tgt = self.fwd_tgt[s:e].copy()
+            wgt = self.fwd_wgt[s:e].copy()
+        else:
+            tgt = np.array([], np.int32)
+            wgt = np.array([], np.float32)
+
+        # Merge delta edges
+        if idx in self.delta_fwd:
+            delta = self.delta_fwd[idx]
+            # Build lookup of existing targets for merging
+            existing = {}
+            for i in range(len(tgt)):
+                existing[int(tgt[i])] = i
+
+            new_tgts = []
+            new_wgts = []
+            for dt, dw in delta.items():
+                if dt in existing:
+                    # Boost existing edge
+                    wgt[existing[dt]] += dw
+                else:
+                    new_tgts.append(dt)
+                    new_wgts.append(dw)
+
+            if new_tgts:
+                tgt = np.concatenate([tgt, np.array(new_tgts, dtype=np.int32)])
+                wgt = np.concatenate([wgt, np.array(new_wgts, dtype=np.float32)])
+
         if len(tgt) > top_k:
             top = np.argpartition(wgt, -top_k)[-top_k:]
             tgt, wgt = tgt[top], wgt[top]
         return tgt, wgt
 
     def get_pmi_neighbors(self, idx):
-        """PMI semantic neighbors. Returns (targets, weights)."""
+        """PMI semantic neighbors, merged with delta PMI."""
         s, e = int(self.pmi_off[idx]), int(self.pmi_off[idx + 1])
-        if s == e:
+        if s == e and idx not in self.delta_pmi:
             return np.array([], np.int32), np.array([], np.float32)
-        return self.pmi_tgt[s:e], self.pmi_wgt[s:e]
+
+        if s < e:
+            tgt = self.pmi_tgt[s:e].copy()
+            wgt = self.pmi_wgt[s:e].copy()
+        else:
+            tgt = np.array([], np.int32)
+            wgt = np.array([], np.float32)
+
+        if idx in self.delta_pmi:
+            delta = self.delta_pmi[idx]
+            existing = set(int(t) for t in tgt)
+            new_tgts = []
+            new_wgts = []
+            for dt, dw in delta.items():
+                if dt not in existing:
+                    new_tgts.append(dt)
+                    new_wgts.append(dw)
+            if new_tgts:
+                tgt = np.concatenate([tgt, np.array(new_tgts, dtype=np.int32)])
+                wgt = np.concatenate([wgt, np.array(new_wgts, dtype=np.float32)])
+
+        return tgt, wgt
 
     def trigram_score(self, prev_idx, cur_idx, next_idx):
-        """Trigram multiplier for a candidate next token."""
+        """Trigram multiplier, checking delta graph first."""
+        # Check delta trigrams first (short-term memory takes priority)
+        delta_key = (prev_idx, cur_idx)
+        if delta_key in self.delta_tri:
+            count = self.delta_tri[delta_key].get(next_idx, 0)
+            if count > 0:
+                return 10.0  # massive boost for learned sequences
+
+        # Fall back to base graph
         key = prev_idx * self.vocab_size + cur_idx
         targets = self.trigrams.get(key)
         if targets is None:
@@ -176,6 +299,29 @@ class LLNGraph:
 
     def detokenize(self, indices):
         return ' '.join(self.idx_to_word[i] for i in indices)
+
+    def out_degree(self, idx):
+        """Effective out-degree including delta graph.
+
+        Delta edges count 100x because they represent high-confidence
+        learned transitions that should overcome the sink penalty.
+        """
+        base = int(self.fwd_off[idx + 1]) - int(self.fwd_off[idx])
+        delta = len(self.delta_fwd.get(idx, {}))
+        return base + delta * 100
+
+    def forget(self):
+        """Clear all short-term memory (delta graph)."""
+        self.delta_fwd.clear()
+        self.delta_tri.clear()
+        self.delta_pmi.clear()
+
+    def memory_stats(self):
+        """Return stats about current short-term memory."""
+        n_fwd = sum(len(v) for v in self.delta_fwd.values())
+        n_tri = sum(len(v) for v in self.delta_tri.values())
+        n_pmi = sum(len(v) for v in self.delta_pmi.values())
+        return {'fwd_edges': n_fwd, 'trigrams': n_tri, 'pmi_links': n_pmi}
 
     def close(self):
         self.env.close()
@@ -300,7 +446,7 @@ def find_targets(graph, prompt_indices, context_indices, activated, pmi_scores,
         score = pmi_score * (4 - hop_dist)
 
         # Flow-aware routing: out_degree / in_degree as fast mass proxy
-        out_deg = int(graph.fwd_off[t + 1]) - int(graph.fwd_off[t])
+        out_deg = graph.out_degree(t)
         in_deg = max(1, int(graph.in_degree[t]))
         pr_ratio = out_deg / in_deg
 
