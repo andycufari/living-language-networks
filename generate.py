@@ -23,7 +23,7 @@ import argparse
 import os
 
 # HuggingFace model config
-HF_REPO = "cufa64/lln_v13_parallel_100k"
+HF_REPO = "cufa64/lln_v16_blend_100k"
 DEFAULT_MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model")
 
 
@@ -47,16 +47,15 @@ def download_model(model_dir=DEFAULT_MODEL_DIR):
         )
         print(f"  Downloaded to {model_dir}")
 
-        # Create lock.mdb (LMDB needs it)
+        # Remove stale lock file if present — LMDB regenerates it
         lock_path = os.path.join(model_dir, "lock.mdb")
-        if not os.path.exists(lock_path):
-            with open(lock_path, 'wb') as f:
-                f.write(b'\x00' * 8192)
+        if os.path.exists(lock_path):
+            os.remove(lock_path)
 
         return model_dir
     except ImportError:
         print("  huggingface_hub not installed. Install with: pip install huggingface_hub")
-        print("  Or download manually from https://huggingface.co/andycufari/lln-v13-wikipedia")
+        print("  Or download manually from https://huggingface.co/cufa64/lln_v16_blend_100k")
         raise
     except Exception as e:
         print(f"  Download failed: {e}")
@@ -189,7 +188,22 @@ class LLNGraph:
 # ═══════════════════════════════════════════════════════════════════
 
 def activate(graph, prompt_indices, top_pct=0.20):
-    """Build semantic field from prompt via 1-hop PMI."""
+    """Build semantic field from prompt via 1-hop PMI.
+
+    Frequency-penalized: raw PMI favors ultra-rare words (proper nouns,
+    technical terms). We multiply by log1p(in_degree) so common words
+    that are ALSO semantically close get prioritized.
+
+    Capital penalty: capitalized tokens that aren't sentence starters
+    (Ages, Horse, Elf, Jedi) are often title fragments, not content.
+    Penalize by 0.3x unless the prompt is all proper nouns.
+    """
+    # Detect if prompt is all proper nouns (e.g. "New York")
+    prompt_all_proper = all(
+        graph.idx_to_word[i][0].isupper() for i in prompt_indices
+        if graph.idx_to_word[i][0].isalpha()
+    )
+
     all_pmi = {}
     for idx in prompt_indices:
         if graph.in_degree[idx] > 20000:
@@ -211,22 +225,41 @@ def activate(graph, prompt_indices, top_pct=0.20):
     if not all_pmi:
         return set(prompt_indices), {}
 
-    weights = sorted(all_pmi.values(), reverse=True)
+    # Adjust scores: frequency multiplier + capital penalty
+    adjusted = {}
+    for t, raw_pmi in all_pmi.items():
+        freq_mult = float(np.log1p(graph.in_degree[t]))
+        score = raw_pmi * freq_mult
+
+        word = graph.idx_to_word[t]
+        if not prompt_all_proper and word[0:1].isupper() and word[0:1].isalpha():
+            score *= 0.3
+
+        adjusted[t] = score
+
+    weights = sorted(adjusted.values(), reverse=True)
     threshold = weights[int(len(weights) * top_pct)] if len(weights) > 5 else 0
     activated = set(prompt_indices)
-    for t, w in all_pmi.items():
-        if w >= threshold:
+    for t, score in adjusted.items():
+        if score >= threshold:
             activated.add(t)
 
-    return activated, all_pmi
+    # Return adjusted scores (not raw PMI) so find_targets ranks correctly
+    return activated, adjusted
 
 
 # ═══════════════════════════════════════════════════════════════════
 # Phase 2 — Target Selection (PMI ∩ Reachability)
 # ═══════════════════════════════════════════════════════════════════
 
-def find_targets(graph, prompt_indices, context_indices, activated, pmi_scores):
-    """Find content targets: activated AND reachable in 2-3 hops."""
+def find_targets(graph, prompt_indices, context_indices, activated, pmi_scores,
+                 tokens_remaining=20):
+    """Find content targets: activated AND reachable in 2-3 hops.
+
+    Flow-aware: uses out-degree / in-degree ratio as a fast proxy for
+    local push/receive mass. Sinks (low ratio) are penalized early in
+    generation and only allowed as targets in the final stretch.
+    """
     context_set = set(context_indices)
     last = context_indices[-1]
 
@@ -265,7 +298,22 @@ def find_targets(graph, prompt_indices, context_indices, activated, pmi_scores):
         hop_dist, _ = reachable[t]
         pmi_score = pmi_scores.get(t, 0)
         score = pmi_score * (4 - hop_dist)
-        targets.append((t, score))
+
+        # Flow-aware routing: out_degree / in_degree as fast mass proxy
+        out_deg = int(graph.fwd_off[t + 1]) - int(graph.fwd_off[t])
+        in_deg = max(1, int(graph.in_degree[t]))
+        pr_ratio = out_deg / in_deg
+
+        if pr_ratio < 0.4:
+            # Sink — penalize unless we're in the final stretch
+            if tokens_remaining > 5:
+                score *= 0.2
+            # else: allow sinks as final destinations (no penalty)
+        elif pr_ratio >= 0.9:
+            # Throughput or source — boost
+            score *= 1.5
+
+        targets.append((t, score, pr_ratio))
 
     targets.sort(key=lambda x: -x[1])
     return targets
@@ -276,84 +324,96 @@ def find_targets(graph, prompt_indices, context_indices, activated, pmi_scores):
 # ═══════════════════════════════════════════════════════════════════
 
 def walk_to_target(graph, start, target, target_pmi, visited,
-                   prev_token=None, max_steps=6, top_k=50):
-    """Walk from start toward target using full graph topology.
+                   prev_token=None, max_steps=8, top_k=50, beam_width=5):
+    """Beam search walk from start toward target.
 
-    Score = (normalized_weight x trigram_multiplier) + (proximity x target_PMI)
+    Maintains beam_width competing paths. Each step expands all paths,
+    scores candidates with the same formula (norm_w × trigram + proximity × PMI),
+    and keeps the top beam_width by average score per step.
+
+    Returns the first path that hits the target, or [] if none do.
     """
+    # Precompute target's forward neighbors for proximity scoring
     ts = int(graph.full_off[target])
     te = int(graph.full_off[target + 1])
     target_out = set()
     for i in range(ts, min(te, ts + 500)):
         target_out.add(int(graph.full_tgt[i]))
 
-    path = []
-    current = start
+    # Each beam entry: (current_token, prev_token, path_tokens, cumulative_score)
+    beam = [(start, prev_token, [], 0.0)]
 
     for step in range(max_steps):
-        s = int(graph.fwd_off[current])
-        e = int(graph.fwd_off[current + 1])
-        if s == e:
+        candidates = []
+
+        for cur, prev, path, cum_score in beam:
+            s = int(graph.fwd_off[cur])
+            e = int(graph.fwd_off[cur + 1])
+            if s == e:
+                continue
+
+            tgt = graph.fwd_tgt[s:e]
+            wgt = graph.fwd_wgt[s:e]
+            if len(tgt) > top_k:
+                top_idx = np.argpartition(wgt, -top_k)[-top_k:]
+                tgt, wgt = tgt[top_idx], wgt[top_idx]
+
+            # Direct hit — return immediately
+            for i in range(len(tgt)):
+                if int(tgt[i]) == target:
+                    return path + [target]
+
+            max_w = float(max(wgt)) if len(wgt) > 0 else 1.0
+            log_max = max(float(np.log1p(max_w)), 1e-6)
+
+            for i in range(len(tgt)):
+                t = int(tgt[i])
+                w = float(wgt[i])
+                norm_w = float(np.log1p(w)) / log_max
+
+                tri_mult = graph.trigram_score(prev, cur, t) if prev is not None else 1.0
+
+                # Proximity: can t reach target in 1 hop? Neighborhood overlap?
+                proximity = 0.0
+                ns = int(graph.fwd_off[t])
+                ne = int(graph.fwd_off[t + 1])
+                for j in range(ns, min(ne, ns + 200)):
+                    if int(graph.fwd_tgt[j]) == target:
+                        proximity = 3.0
+                        break
+                if proximity == 0:
+                    n_tgts = set()
+                    for j in range(ns, min(ne, ns + 100)):
+                        n_tgts.add(int(graph.fwd_tgt[j]))
+                    overlap = len(n_tgts & target_out)
+                    if overlap > 0:
+                        proximity = min(overlap * 0.3, 2.0)
+
+                step_score = (norm_w * tri_mult) + (proximity * target_pmi)
+
+                visits = visited.get(t, 0)
+                if visits >= 3:
+                    step_score -= 10.0
+                elif visits > 0:
+                    step_score -= 0.3 * visits
+
+                # Also penalize revisiting tokens within THIS path
+                if t in path:
+                    step_score -= 2.0
+
+                new_cum = cum_score + step_score
+                new_path = path + [t]
+                candidates.append((t, cur, new_path, new_cum))
+
+        if not candidates:
             break
 
-        tgt = graph.fwd_tgt[s:e]
-        wgt = graph.fwd_wgt[s:e]
-        if len(tgt) > top_k:
-            top_idx = np.argpartition(wgt, -top_k)[-top_k:]
-            tgt, wgt = tgt[top_idx], wgt[top_idx]
+        # Prune: keep top beam_width by average score per step
+        # Average prevents long paths from winning purely by accumulation
+        candidates.sort(key=lambda c: -c[3] / len(c[2]))
+        beam = candidates[:beam_width]
 
-        # Direct hit?
-        for i in range(len(tgt)):
-            if int(tgt[i]) == target:
-                path.append(target)
-                return path
-
-        max_w = float(max(wgt)) if len(wgt) > 0 else 1.0
-        log_max = max(float(np.log1p(max_w)), 1e-6)
-
-        best_t, best_score = -1, -999.0
-        for i in range(len(tgt)):
-            t = int(tgt[i])
-            w = float(wgt[i])
-            norm_w = float(np.log1p(w)) / log_max
-
-            tri_mult = graph.trigram_score(prev_token, current, t) if prev_token is not None else 1.0
-
-            proximity = 0.0
-            ns = int(graph.fwd_off[t])
-            ne = int(graph.fwd_off[t + 1])
-            for j in range(ns, min(ne, ns + 200)):
-                if int(graph.fwd_tgt[j]) == target:
-                    proximity = 3.0
-                    break
-            if proximity == 0:
-                n_tgts = set()
-                for j in range(ns, min(ne, ns + 100)):
-                    n_tgts.add(int(graph.fwd_tgt[j]))
-                overlap = len(n_tgts & target_out)
-                if overlap > 0:
-                    proximity = min(overlap * 0.3, 2.0)
-
-            score = (norm_w * tri_mult) + (proximity * target_pmi)
-
-            visits = visited.get(t, 0)
-            if visits >= 3:
-                score -= 10.0
-            elif visits > 0:
-                score -= 0.3 * visits
-
-            if score > best_score:
-                best_score = score
-                best_t = t
-
-        if best_t < 0 or best_score < -5:
-            break
-
-        path.append(best_t)
-        prev_token = current
-        current = best_t
-
-    return path
+    return []
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -386,8 +446,10 @@ def generate(graph, prompt_text, max_tokens=20, max_chains=15, verbose=False):
             break
 
         context = list(prompt_indices) + generated
-        targets = find_targets(graph, prompt_indices, context, activated, pmi_scores)
-        targets = [(t, s) for t, s in targets if t not in depleted and t not in visited]
+        tokens_remaining = max_tokens - len(generated)
+        targets = find_targets(graph, prompt_indices, context, activated, pmi_scores,
+                               tokens_remaining=tokens_remaining)
+        targets = [(t, s, pr) for t, s, pr in targets if t not in depleted and t not in visited]
 
         if not targets:
             if verbose:
@@ -397,17 +459,25 @@ def generate(graph, prompt_text, max_tokens=20, max_chains=15, verbose=False):
         # Synaptic fatigue: later chains require stronger PMI to fire.
         # Hyperbolic decay — halves at chain ~7, never reaches zero.
         fatigue = 1.0 / (1.0 + 0.15 * chain)
-        targets = [(t, s * fatigue) for t, s in targets]
+        targets = [(t, s * fatigue, pr) for t, s, pr in targets]
         targets.sort(key=lambda x: -x[1])
 
-        dest_idx, dest_score = targets[0]
+        dest_idx, dest_score, dest_pr = targets[0]
 
         if verbose:
+            if dest_pr < 0.4:
+                role = "SINK"
+            elif 0.9 <= dest_pr <= 1.1:
+                role = "THROUGHPUT"
+            elif dest_pr > 3.0:
+                role = "SOURCE"
+            else:
+                role = "NEUTRAL"
             print(f"  chain {chain}: target={graph.idx_to_word[dest_idx]} "
-                  f"(PMI={dest_score:.2f}, fatigue={fatigue:.2f}, {len(targets)} remaining)")
+                  f"(PMI={dest_score:.2f}, PR={dest_pr:.2f} [{role}], {len(targets)} remaining)")
 
         path = walk_to_target(graph, current, dest_idx, dest_score, visited,
-                              prev_token=prev_token, max_steps=6)
+                              prev_token=prev_token)
 
         reached = len(path) > 0 and path[-1] == dest_idx
 
