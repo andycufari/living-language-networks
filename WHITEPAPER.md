@@ -1,4 +1,4 @@
-# Topology is Semantics: Zero-Parameter Language Generation via Biologically-Inspired Graph Routing
+# Topology is Semantics: Language Generation via Biologically-Inspired Graph Routing
 
 **Andy Cufari**
 *April 2026*
@@ -7,15 +7,15 @@
 
 ## Abstract
 
-We present Living Language Networks (LLN), a language generation system that uses zero learned parameters. Instead of gradient descent over millions of weights, LLN builds a directed weighted graph from raw text co-occurrence counts and generates language by routing activation through the graph's topology.
+We present Living Language Networks (LLN), a language generation system that uses no gradient descent, no backpropagation, and no learned weight matrices. LLN builds a directed weighted graph from raw text co-occurrence counts and generates language by routing activation through the graph's topology.
 
-On a 40-prompt benchmark against a 17.7M-parameter GPT-2 model trained on the same corpus, LLN achieves **75% win rate** on topical relevance (0.510 vs 0.225), **76.1% content word ratio** (vs 45.6%), and **91.7% vocabulary diversity** (vs 65.5%) — while producing zero degenerate outputs.
+The architecture separates two functions that neurolinguistics has long identified as distinct: **semantic targeting** (what to say) via a frequency-penalized PMI activation field, and **grammatical execution** (how to say it) via beam search over co-occurrence edge weights and trigram patterns. We demonstrate empirically that these two signals are independently extractable from the same graph: a walker configured for semantic pull produces topically relevant but ungrammatical output, while a walker configured for grammatical momentum produces fluent English sentences without semantic content. The graph encodes both grammar and meaning as separable structures in its topology.
 
-The current model (v16) is trained on a 32GB blend of three corpora — FineWeb-Edu, Project Gutenberg, and OpenWebText — producing a graph with 117.5 million forward edges, 34.5 million PMI semantic associations, and 11.9 million trigram pairs. The model builds in approximately 3 hours on an 8-core CPU. Generation takes ~0.3-0.6 seconds per prompt. No GPU is required at any stage.
+On a 40-prompt benchmark against a 17.7M-parameter GPT-2 model trained on the same corpus, LLN achieves higher topical relevance (0.510 vs 0.225) and vocabulary diversity (91.7% vs 65.5%), while GPT-2 achieves superior grammatical fluency. This tradeoff — topology excels at content selection, neural networks excel at syntactic binding — is a central finding of this work.
 
-The architecture introduces five mechanisms that solve long-standing problems in unconstrained graph walks: **frequency-penalized PMI activation** prevents rare-word hallucination, **flow-aware target selection** avoids topological dead ends, **beam search path competition** finds grammatical bridges across low-weight gaps, **target depletion** eliminates Markovian drift, and **anchored activation** prevents the semantic field from expanding beyond the original prompt. Together, these produce a system where sentence length emerges naturally from the topology — generation halts when semantic energy is exhausted, without a hardcoded maximum.
+The current model (v16) is built from a 32GB blend of three corpora — FineWeb-Edu, Project Gutenberg, and OpenWebText — producing a graph with 117.5 million forward edges, 34.5 million PMI semantic associations, and 11.9 million trigram pairs. The model builds in approximately 3 hours on an 8-core CPU. Generation takes ~0.3-0.6 seconds per prompt. No GPU is required at any stage.
 
-Every generation step is fully traceable: which targets were selected, which were reached, which were organically pruned, and why the system halted. The model is a glass box.
+Every generation step is fully traceable: which targets were selected, which were reached, which were organically pruned, and why the system halted. The model is a complete glass box.
 
 ---
 
@@ -33,7 +33,7 @@ This is the **amnesia problem**: without a persistent representation of intent, 
 
 Transformer architectures solve the amnesia problem through self-attention: every token attends to every other token, maintaining context across the full sequence. This works extraordinarily well, but at significant cost.
 
-Self-attention requires O(n^2) computation per layer, where n is the sequence length. More critically, the model's understanding of language is encoded as continuous-valued weight matrices — millions of floating-point numbers that cannot be individually interpreted. When the model produces an incorrect or nonsensical output, there is no mechanism to determine *why*. The weights that caused the error are distributed across the entire parameter space.
+Self-attention requires O(n²) computation per layer, where n is the sequence length. More critically, the model's understanding of language is encoded as continuous-valued weight matrices — millions of floating-point numbers that cannot be individually interpreted. When the model produces an incorrect or nonsensical output, there is no mechanism to determine *why*. The weights that caused the error are distributed across the entire parameter space.
 
 This is the **black box problem**: the system works, but nobody — including the system itself — can explain its decisions. When a transformer hallucinates, the hallucination is structurally indistinguishable from a correct output.
 
@@ -41,7 +41,7 @@ This is the **black box problem**: the system works, but nobody — including th
 
 LLN takes a different approach entirely. Instead of learning implicit representations through gradient descent, it builds an explicit graph of observed word transitions and navigates that graph using biologically-inspired routing systems.
 
-The graph is the model. Every edge is a directly observed fact: "word A was followed by word B exactly N times in the training corpus." There are no hidden layers, no learned embeddings, no parameters to tune. The topology of the graph — which words connect to which, and how strongly — *is* the semantics.
+The graph is the model. Every edge is a directly observed fact: "word A was followed by word B exactly N times in the training corpus." There are no hidden layers, no learned embeddings, no parameters to tune via optimization. The topology of the graph — which words connect to which, and how strongly — *is* the semantics.
 
 ---
 
@@ -62,6 +62,8 @@ LLN explicitly separates these two functions.
 **Phase 3 (Broca)**: A beam search walker evaluates multiple competing grammatical paths in parallel, finding bridges across low-weight topological gaps that a greedy walker would miss.
 
 This separation is the core architectural insight. Each system operates on different representations, at different timescales, with different objectives — and each maps to a distinct neural subsystem.
+
+A key empirical finding of this work (Section 5) is that this separation is not merely structural but functional: when the walker is configured to follow only the grammatical signal (edge weights + trigrams), it produces fluent English; when configured to follow only the semantic signal (PMI activation), it produces topically coherent word sequences. The two signals are independently extractable from the same graph topology.
 
 ---
 
@@ -157,9 +159,9 @@ Where:
 - **proximity(c)**: c has a forward edge to t → 3.0. c shares outgoing neighbors with t → min(overlap × 0.3, 2.0). Otherwise → 0.0
 - **PMI_t**: the target's adjusted PMI score, modulating pull strength
 
-The beam search evaluates up to **8 steps** (increased from 6 in the greedy walker). Paths are ranked by **average score per step** — this prevents long paths from winning purely by accumulation and keeps the beam focused on quality over length.
+The beam search evaluates up to **8 steps**. Paths are ranked by **average score per step** — this prevents long paths from winning purely by accumulation and keeps the beam focused on quality over length.
 
-**Why beam search?** The greedy walker gets trapped by local minima. If the highest-scoring single step leads away from the target, the greedy walker follows it and never recovers. Beam search maintains 5 alternative paths simultaneously, allowing the system to explore a "low-weight bridge" (e.g., stepping through a function word with weak edge weight) that ultimately leads to the target. This is the difference between a chess player evaluating only the best move versus evaluating the best 5 moves — the winner often requires a temporary sacrifice.
+**Why beam search?** The greedy walker gets trapped by local minima. If the highest-scoring single step leads away from the target, the greedy walker follows it and never recovers. Beam search maintains 5 alternative paths simultaneously, allowing the system to explore a "low-weight bridge" that ultimately leads to the target.
 
 **Target hit**: If any path in the beam reaches the target token, search halts immediately and that path is returned. Failed walks (no path reaches target in 8 steps) return empty — triggering organic pruning.
 
@@ -179,7 +181,7 @@ Three halting conditions exist:
 
 ---
 
-## 4. Core Breakthroughs
+## 4. Core Mechanisms
 
 ### 4.1 Solving Markovian Drift
 
@@ -195,19 +197,17 @@ The fix is mathematically simple: `adjusted = raw_PMI × log(1 + frequency)`. Co
 
 ### 4.3 Flow-Aware Routing (Solving the Sink Trap)
 
-Our topological analysis (TOPOLOGY_DEBUG_V16.md) revealed that in the v16 blend model, most content words are **topological sinks** — they absorb weight from many sources but don't push forward. "flames" has push/receive ratio 0.231. "ashes" has 0.232. "extinguisher" has 0.113.
+Topological analysis revealed that in the v16 blend model, most content words are **topological sinks** — they absorb weight from many sources but don't push forward. "flames" has push/receive ratio 0.231. "ashes" has 0.232. "extinguisher" has 0.113.
 
-The old walker targeted these words first (highest PMI) and immediately got stuck — reaching "alive" in one hop from "burned" but finding no forward path from there. Every remaining target was another sink.
+The original walker targeted these words first (highest PMI) and immediately got stuck — reaching "alive" in one hop from "burned" but finding no forward path from there. Every remaining target was another sink.
 
 Flow-aware routing penalizes sinks (0.2x) and boosts throughput nodes (1.5x), steering the walker toward words like "eyes" (0.905), "flashed" (0.905), "brightly" (0.416 but reachable through throughput chains). The result: "The fire burned" went from 1 token to 15 tokens.
 
 ### 4.4 Beam Search (Solving Bridge Blindness)
 
-The greedy walker evaluated exactly one candidate at each step — the locally highest-scoring neighbor. If the best single step led away from the target, the walker followed it and never recovered. This produced a systematic failure to reach targets that required a temporary low-weight step (a "bridge").
+The greedy walker evaluated exactly one candidate at each step. If the best single step led away from the target, the walker followed it and never recovered. This produced a systematic failure to reach targets that required a temporary low-weight step (a "bridge").
 
 Beam search maintains 5 competing paths. At each of 8 steps, all paths expand simultaneously. The winning path is often one that took a temporarily low-scoring step through a function word to reach a high-value content bridge on the other side.
-
-The impact is measurable across all prompts:
 
 | Prompt | Greedy (6 steps) | Beam (8 steps, width 5) |
 |--------|-----------------|------------------------|
@@ -217,49 +217,39 @@ The impact is measurable across all prompts:
 | The volcano erupted | 1 token | 7 tokens |
 | The ship sailed | 10 tokens | 20 tokens |
 
-Generation time increases from ~0.1s to ~0.3-0.6s per prompt — an acceptable tradeoff for dramatically improved reachability.
-
-### 4.5 Organic Pruning
-
-Not all targets are reachable, even with beam search. When no path in the beam can reach the target within 8 steps, the walk fails. The target is depleted and the system moves on. This creates a continuous, organic decay threshold: as the field depletes and only weak targets remain, the system naturally halts.
-
-### 4.6 The Glass Box
+### 4.5 The Glass Box
 
 Every LLN generation produces a complete trace:
 
 ```
-chain 0:  target=extinguisher (PMI=134.21, 55 remaining) → missed (organic pruning)
-chain 1:  target=alive (PMI=28.36, 54 remaining)         → reached: alive
-chain 5:  target=safety (PMI=11.51, 33 remaining)        → reached: , and the public safety
-chain 8:  target=camp (PMI=6.18, 36 remaining)           → reached: training camp
-chain 10: target=eyes (PMI=4.82, 44 remaining)           → reached: with his eyes
-chain 11: target=flashed (PMI=8.84, 47 remaining)        → reached: flashed
-chain 12: target=brightly (PMI=3.96, 43 remaining)       → reached: brightly
-chain 13: target=glowing (PMI=6.93, 65 remaining)        → reached: glowing
-chain 14: target=cheeks (PMI=7.96, 71 remaining)         → reached: cheeks
+chain 0:  target=extinguisher (PMI=134.21, PR=0.75 [NEUTRAL]) → missed (organic pruning)
+chain 1:  target=alive (PMI=28.36, PR=0.02 [SINK])            → reached: alive
+chain 5:  target=safety (PMI=11.51, PR=0.02 [SINK])           → reached: , and the public safety
+chain 8:  target=camp (PMI=6.18, PR=0.02 [SINK])              → reached: training camp
+chain 10: target=eyes (PMI=4.82, PR=0.02 [SINK])              → reached: with his eyes
+chain 11: target=flashed (PMI=8.84, PR=0.04 [SINK])           → reached: flashed
+chain 12: target=brightly (PMI=3.96, PR=0.10 [SINK])          → reached: brightly
 ```
 
-For every token, you can identify: which target it was walking toward, what score justified the walk, and whether the target was reached or pruned.
+For every token, you can identify: which target it was walking toward, what score justified the walk, the topological role that influenced routing, and whether the target was reached or pruned.
 
 ---
 
-## 5. Benchmark Results
+## 5. Experiments
 
-### 5.1 Experimental Setup
+### 5.1 Benchmark: LLN vs GPT-2 (Same Corpus)
 
 We compare three systems on 40 prompts spanning nature, history, science, daily life, abstract concepts, and edge cases (2-word prompts):
 
 | System | Parameters | Training | Corpus |
 |--------|-----------|----------|--------|
-| **LLN** | 0 | 5 min (CPU) | web_text + Wikipedia (~500MB) |
+| **LLN** | 0 learned | 5 min (CPU) | web_text + Wikipedia (~500MB) |
 | **GPT-2** | 17,735,936 | 8.5 hours (GPU/MPS) | Same |
 | **Markov** | 0 | — | Same graph as LLN |
 
 GPT-2 is a custom model trained from scratch (6 layers, 256 embedding, 8 heads) — not a pretrained checkpoint. Both systems had equal access to the same training data.
 
 Scoring uses PMI-based activation relevance: the fraction of output tokens that fall within the prompt's semantic field. This measures topical coherence — does the output relate to what was asked?
-
-### 5.2 Results
 
 | Metric | LLN | GPT-2 | Markov |
 |--------|-----|-------|--------|
@@ -270,28 +260,45 @@ Scoring uses PMI-based activation relevance: the fraction of output tokens that 
 | **Distinct-2** | **0.925** | 0.817 | 1.000 |
 | **Prompt Echo** | **0.028** | 0.199 | 0.000 |
 | **Avg Tokens** | 10.3 | 18.5 | 20.0 |
-| **Avg Gen Time** | **0.041s** | 0.243s | 0.000s |
+
+**Scoring bias note:** The relevance metric uses LLN's own PMI activation field. A perplexity-based metric would likely favor GPT-2. The metrics in this paper measure *topical coherence*, not *linguistic fluency*. We include this benchmark to demonstrate that graph-based routing produces non-trivially topical output, not to claim superiority over neural language models.
 
 Note: Benchmarks were conducted on an earlier model (v13, Wikipedia). The v16 blend model with beam search produces longer, denser output — a new benchmark round is pending.
 
-### 5.3 Notable Outputs
+### 5.2 Grammar-Semantics Separability
 
-| Prompt | LLN | GPT-2 |
-|--------|-----|-------|
-| the emperor declared war | crimes committed himself Emperor Justinian II's illegitimate | on the throne of the Empire, and the emperor was the first emperor |
-| deep in the forest | fires | a large, narrow, narrow, narrow, narrow, narrow |
-| the government decided to | write down upon reaching reforms enacted policies implemented | build a new building, which was built in the late 19th century |
-| the doctor examined the patient | confidentiality | patient's body was examined by the surgeon |
+Adversarial testing with modified walker configurations revealed that the graph encodes grammatical and semantic information as separable structures.
 
-### 5.4 GPT-2 Degenerate Modes
+**Experiment:** The beam search step scoring function `step_score = (norm_w × tri_mult) + (proximity × target_pmi)` contains two terms. The first (`norm_w × tri_mult`) reflects grammatical transition strength — high-weight edges and trigram-supported continuations. The second (`proximity × target_pmi`) reflects semantic pull toward activated targets. In the default configuration, the semantic pull term is approximately 25× larger than the grammar term, effectively drowning the grammatical signal.
 
-Despite 8.5 hours of GPU training, GPT-2 produces degenerate loops on 3 of 40 prompts:
+**Grammar-dominant configuration:** Log-compressing the semantic pull (`proximity × log(1 + target_pmi)`) brings both terms to comparable scale. This produces fluent English clause structure: "They seem to know you want to do it. I mean, and the great care, and I don't expect" — but with near-zero topical relevance to the original prompt. The walker follows high-weight grammatical highways (primarily conversational patterns from Gutenberg fiction) regardless of the semantic activation field.
 
-- "deep in the forest" → `a large, narrow, narrow, narrow, narrow, narrow, narrow`
-- "the sun set behind" → `the sun was the sun's sun. The sun was the sun's`
-- "the ancient city of" → `the city is the largest city in the city. The city is the largest city`
+**Semantics-dominant configuration:** The default walker produces topically dense but ungrammatical output: "northward up the second story goes straight white supremacists marched rapidly and other two young fellow officers came forward" — where nearly every word is PMI-adjacent to the prompt "The army marched" but the syntactic structure is broken.
 
-LLN never produces degenerate output. It either generates semantically justified content or halts.
+**Interpretation:** The same graph topology contains both signals. Forward edge weights and trigram patterns encode clause structure, verb argument patterns, and function word sequencing. PMI edges encode semantic neighborhoods and topical associations. These are independently extractable: a walker tuned for one produces strong results on that dimension while performing poorly on the other. Combining them into output that is both grammatical and topically relevant remains an open problem.
+
+### 5.3 The Cadence Walker (Experimental)
+
+To address the grammar-semantics combination problem, we developed an experimental walker architecture that enforces the natural function/content word rhythm observed in English sentences.
+
+**Observation:** English alternates between grammatical function words and semantic content words with a characteristic rhythm: 1-3 function words, then a content word, repeating. "The [fire] burned through the [building] and the [flames] spread" follows this pattern. Neither the semantic-dominant walker (all content, no grammar) nor the grammar-dominant walker (all function words, no content) produces this rhythm.
+
+**Mechanism:** The cadence walker tracks consecutive function words. After a configurable maximum streak (default: 3), it forces a content word landing by running a mini beam search (depth 3, width 3) to find the nearest grammatically reachable content word within the semantic fence — the set of activated words plus function words. The entire bridge path is emitted, maintaining grammatical coherence.
+
+**Early results:** The cadence walker produces grammatical phrases with semantic content ("most distant galaxies", "hand trembled", "very proud") but at lower content density than the semantic-dominant walker. Content hit rate is 1-5 words per 20-token output. The primary failure mode is bridge search exhaustion: content words are topologically sparse at most function-word positions, and the 3-hop beam sometimes cannot find a path.
+
+This walker is experimental and available for testing. Full research notes documenting the iteration process are included in the repository (WALKER_RESEARCH.md).
+
+### 5.4 Adversarial Prompts
+
+Testing with syntactically adversarial prompts reveals structural limitations of flat graph topology:
+
+| Prompt | Tests | Result |
+|--------|-------|--------|
+| "the cat that the dog chased ran" | Center-embedded clause, long-range binding | Failure. PMI activates animal vocabulary but the cat→ran subject binding is invisible. |
+| "she didn't go to the store because it was closed" | Negation, causal reasoning | Failure. "didn't" filtered as function word (in_degree > 20K). "store" + "closed" activate identical field to "went to the store." |
+
+These failures are structural, not tunable. The frozen PMI field has no polarity mechanism (negation is invisible), no positional encoding (word order is lost after activation), and no hierarchical structure (relative clauses are flattened). These capabilities would require architectural additions beyond the current graph-routing paradigm.
 
 ---
 
@@ -299,37 +306,41 @@ LLN never produces degenerate output. It either generates semantically justified
 
 ### 6.1 Honest Limitations
 
-**Grammar**: LLN produces topological word sequences, not syntactically correct sentences. Output like "northward up the second story goes straight white supremacists marched rapidly" contains the right content words in plausible proximity, but does not constitute a grammatical English sentence. GPT-2 produces significantly better syntax.
+**Grammar**: LLN produces topological word sequences, not syntactically correct sentences. Output like "northward up the second story goes straight white supremacists marched rapidly" contains topic-relevant content words in plausible local proximity, but does not constitute a grammatical English sentence. This is the primary limitation.
+
+**No long-range syntax**: The system has no mechanism for center-embedded clauses, negation, pronoun binding, or any syntactic structure that requires maintaining state across intervening material. These require positional encoding or hierarchical representations that flat graph topology does not provide.
+
+**Scoring balance**: The grammar-semantics separability finding (Section 5.2) demonstrates that both signals exist in the topology but cannot be effectively combined through additive scoring. The grammar term and semantic pull term operate at different scales and in different units. Tuning their relative weight produces either fluent nonsense or topical word salad, with no stable equilibrium.
 
 **Scoring bias**: The relevance metric uses LLN's own PMI activation field. A perplexity-based metric would likely favor GPT-2. The metrics in this paper measure *topical coherence*, not *linguistic fluency*.
 
-**Corpus artifacts**: The model faithfully exposes the biases of its training data. OpenWebText leaks web artifacts ("HTML video streaming"). Gutenberg adds archaic patterns ("hath", "thee"). These are data issues, not algorithmic ones.
+**Corpus artifacts**: The model faithfully exposes the biases of its training data. OpenWebText leaks web artifacts ("HTML", ".org", ".com"). Gutenberg adds archaic patterns ("hath", "thee"). Non-English tokens (Spanish, Portuguese) from OpenWebText leak through the Latin-alphabet tokenizer.
 
-**Sink-dominated prompts**: Some prompts (e.g., "The volcano erupted") activate semantic fields where nearly all content words are topological sinks. Flow-aware routing mitigates this but doesn't fully solve it — these prompts still produce shorter output (7 tokens vs 20 for prompts with richer throughput topology).
-
-**GPT-2 comparison**: The GPT-2 model used in benchmarks is a small custom model (17.7M parameters, 6 layers). Larger pretrained models would produce significantly better output. The comparison demonstrates the efficiency of graph-based routing, not superiority over the state of the art.
+**GPT-2 comparison**: The GPT-2 model used in benchmarks is a small custom model (17.7M parameters, 6 layers). Larger pretrained models would produce significantly better output. The comparison demonstrates the efficiency of graph-based routing on a controlled corpus, not superiority over the state of the art.
 
 ### 6.2 Future Directions
 
-**Hybrid architecture**: The most promising direction is using LLN as a semantic pre-processor for a small transformer. LLN would provide a topologically-validated word cloud — the content targets, in order, with connector positions marked — and a lightweight language model would format this into syntactically correct English.
+**The grammar-semantics combination problem**: The cadence walker (Section 5.3) is a first attempt. More promising approaches include two-phase generation (use PMI targeting to select an ordered content skeleton, then use grammar-first walking to infill syntactic structure between content words) and local edge normalization within the semantic fence (making content words locally competitive with function words at positions where they're topologically adjacent).
 
-**Full subnetwork mass**: The current flow-aware routing uses a fast proxy (out_degree / in_degree). Our research shows that computing full local weight sums within the activated subnetwork reveals much richer role information — "the" shifts from a balanced node globally to a weight black hole in military context. Integrating full subnetwork mass computation into the walker could enable truly context-aware grammatical routing.
+**Hybrid architecture**: Using LLN as a semantic pre-processor for a small transformer. LLN would provide a topologically-validated content plan — the semantic targets, in order — and a lightweight language model would format this into syntactically correct English.
 
-**Multi-hop PMI propagation**: Current activation uses 1-hop PMI from prompt words. Propagating activation through 2-3 PMI hops (with appropriate decay) would produce richer semantic fields for short prompts while maintaining precision.
+**Full subnetwork mass**: The current flow-aware routing uses a fast proxy (out_degree / in_degree). Computing full local weight sums within the activated subnetwork reveals richer role information — "the" shifts from balanced globally to a weight black hole in military context. Integrating full subnetwork mass into the walker could enable context-aware grammatical routing.
 
-**Live learning**: The immutable graph could be augmented with an in-memory overlay (a "Delta Graph") to enable real-time learning without modifying the base model. Learned edges would compete with frozen edges, enabling O(1) fact absorption without catastrophic forgetting.
+**Multi-hop PMI propagation**: Current activation uses 1-hop PMI from prompt words. Propagating activation through 2-3 PMI hops (with appropriate decay) would produce richer semantic fields for short prompts.
+
+**Corpus quality**: Filtering non-English tokens and web artifacts from the training pipeline would improve activation quality. Language detection during vocabulary building and URL/HTML pattern filtering during bigram counting are straightforward additions.
 
 ---
 
 ## 7. Conclusion
 
-LLN demonstrates that topical language generation does not require learned parameters. A directed weighted graph, built from raw co-occurrence statistics in hours on a CPU, can outperform a neural network with 17.7 million learned weights on the task of producing topically relevant output.
+LLN demonstrates that raw co-occurrence topology encodes both semantic content and grammatical structure as separable, independently extractable signals. A directed weighted graph built from counting word pairs — with no gradient descent, no learned weight matrices, and no optimization loop — can produce topically coherent output that outperforms a 17.7M-parameter neural network on semantic relevance metrics, while the same graph's edge weights and trigram patterns encode fluent English clause structure accessible through alternative walker configurations.
 
-The key insight is architectural: by separating semantic routing (PMI activation) from grammatical execution (beam search walking), by implementing biologically-inspired mechanisms like synaptic depression (target depletion) and executive attention (PMI-modulated proximity), and by using topological analysis to dynamically classify the landscape (flow-aware routing), we achieve coherent multi-step generation without the amnesia of Markov chains or the opacity of transformers.
+The current system does not produce grammatical English sentences. This is an honest limitation, not a hidden one. The contribution is architectural: by separating semantic routing (PMI activation) from grammatical execution (beam search), by implementing biologically-inspired mechanisms like synaptic depression (target depletion) and flow-aware routing (sink/source classification), and by demonstrating that these signals are separable in the topology, we establish a foundation for glass-box language generation where every decision is traceable and every output is justified by observable graph structure.
 
-The model is a glass box. Every decision is traceable. Every output is justified by observable graph structure. When the system has nothing meaningful to say, it stops.
+When the system has nothing meaningful to say, it stops. When it says something unexpected, you can see exactly why.
 
-Topology is semantics. The meaning is in the structure.
+The meaning is in the structure. The grammar is in the edges. Combining them is the open problem.
 
 ---
 
@@ -340,7 +351,7 @@ pip install numpy lmdb huggingface_hub
 python generate.py --prompt "The fire burned" --verbose
 ```
 
-The model (2.1 GB) downloads automatically from HuggingFace on first run. Full source code, training scripts, and benchmark suite are available at the project repository.
+The model (2.1 GB) downloads automatically from HuggingFace on first run. Full source code, training scripts, benchmark suite, and experimental walker implementations are available at the project repository.
 
 ---
 
@@ -358,4 +369,4 @@ The model (2.1 GB) downloads automatically from HuggingFace on first run. Full s
 
 ---
 
-*"Language is emerging from the topology. We are just cleaning the dirt."*
+*"The grammar is in the edges. The meaning is in the PMI. The rhythm is in the cadence. We just need to wire them together."*

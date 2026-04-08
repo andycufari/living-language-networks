@@ -686,8 +686,8 @@ def main():
         description="LLN - Zero-parameter language generation from graph topology")
     parser.add_argument("--model", type=str, default=None,
                         help="Path to LMDB model directory (auto-downloads if not set)")
-    parser.add_argument("--prompt", type=str, default=None,
-                        help="Input prompt (or omit for demo)")
+    parser.add_argument("--prompt", type=str, nargs='+', default=None,
+                        help="One or more prompts (or omit for demo)")
     parser.add_argument("--max-tokens", type=int, default=20,
                         help="Maximum tokens to generate")
     parser.add_argument("--verbose", action="store_true",
@@ -738,7 +738,7 @@ def main():
                 print(f"     content: {', '.join(result['content_words'])}")
             print()
     else:
-        prompts = [args.prompt] if args.prompt else DEFAULT_PROMPTS
+        prompts = args.prompt if args.prompt else DEFAULT_PROMPTS
 
         for prompt in prompts:
             t0 = time.time()
