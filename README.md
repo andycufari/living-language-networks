@@ -10,12 +10,12 @@ python generate.py --prompt "The fire burned" --verbose
 ```
 
 ```
-chain 1:  target=alive (PMI=28.36, PR=0.02 [SINK])    → reached: alive
-chain 5:  target=safety (PMI=11.51, PR=0.02 [SINK])   → reached: , and the public safety
-chain 8:  target=camp (PMI=6.18, PR=0.02 [SINK])      → reached: training camp
-chain 10: target=eyes (PMI=24.08, PR=0.02 [SINK])     → reached: with his eyes
-chain 11: target=flashed (PMI=41.71, PR=0.04 [SINK])  → reached: flashed
-chain 12: target=brightly (PMI=19.82, PR=0.10 [SINK]) → reached: brightly
+chain 1:  target=alive (PMI=28.36, PR=0.02 [SINK])     → reached: alive
+chain 5:  target=safety (PMI=11.51, PR=0.02 [SINK])    → reached: , and the public safety
+chain 10: target=eyes (PMI=4.82, PR=0.02 [SINK])       → reached: , and his eyes
+chain 11: target=flashed (PMI=8.34, PR=0.04 [SINK])    → reached: flashed
+chain 12: target=brightly (PMI=3.96, PR=0.10 [SINK])   → reached: brightly
+chain 14: target=cheeks (PMI=7.96, PR=0.11 [SINK])     → reached: cheeks
 ```
 
 Every word is traceable. Every target, every hit, every miss, every halt reason — visible. The model downloads automatically from HuggingFace on first run (~2.1 GB).
@@ -65,13 +65,14 @@ python generate.py --prompt "The fire burned" --verbose
 chain 0:  target=extinguisher (PMI=134.21, PR=0.75 [NEUTRAL]) → missed (organic pruning)
 chain 1:  target=alive (PMI=28.36, PR=0.02 [SINK])            → reached: alive
 chain 5:  target=safety (PMI=11.51, PR=0.02 [SINK])           → reached: , and the public safety
-chain 8:  target=camp (PMI=6.18, PR=0.02 [SINK])              → reached: training camp
-chain 10: target=eyes (PMI=24.08, PR=0.02 [SINK])             → reached: with his eyes
-chain 11: target=flashed (PMI=41.71, PR=0.04 [SINK])          → reached: flashed
-chain 12: target=brightly (PMI=19.82, PR=0.10 [SINK])         → reached: brightly
+chain 10: target=eyes (PMI=4.82, PR=0.02 [SINK])              → reached: , and his eyes
+chain 11: target=flashed (PMI=8.34, PR=0.04 [SINK])           → reached: flashed
+chain 12: target=brightly (PMI=3.96, PR=0.10 [SINK])          → reached: brightly
+chain 13: target=glowing (PMI=6.93, PR=0.07 [SINK])           → reached: glowing
+chain 14: target=cheeks (PMI=7.96, PR=0.11 [SINK])            → reached: cheeks
 ```
 
-Every target selection shows the PMI score that justified the walk and the topological role (SINK/THROUGHPUT/SOURCE) that determined routing priority. You can trace exactly why "extinguisher" was attempted and failed (organic pruning — no beam path reached it in 8 steps), and why "alive" succeeded (1-hop from "burned"). The model is a glass box.
+Every target selection shows the PMI score that justified the walk and the topological role (SINK/THROUGHPUT/SOURCE) that determined routing priority. You can trace exactly why "extinguisher" was attempted and failed (organic pruning, no beam path reached it in 8 steps), and why "alive" succeeded (1-hop from "burned"). The model is a glass box.
 
 ---
 
@@ -79,19 +80,20 @@ Every target selection shows the PMI score that justified the walk and the topol
 
 | Prompt | Output | Tokens |
 |--------|--------|--------|
-| The king | a more powerful voice heard my lord hath commanded thee thy life . The most famous letter addressed a | 20 |
-| She opened the door | opened fire on the door swung open . She paused abruptly closed his lips , she said Jack Ruby smiled | 20 |
-| The fire burned | alive . The government of the state police department s own personal safety training camp with his eyes flashed brightly | 20 |
-| The river flows | south bank of the most beautiful valley bottoms of water flow . The main stream flowing blood | 17 |
-| The ship sailed | northward along the right to go straight to him so forth a big leagues farther inland navigation channel the whole | 20 |
-| Dark clouds | that this matter is called a small village green leafy green energy | 12 |
-| The army marched | northward up the second story goes straight white supremacists marched rapidly and other two young fellow officers came forward an | 20 |
-| The volcano erupted | violently excited crowd s largest ethnic violence | 7 |
-| The old man walked | beside him go straight away so very much more advanced rapidly . A woman in my old lady . A young gentleman , the old chap , and a young man's best friend of the same age . My dear | 40 |
+| The king | of the most powerful , and I heard a little boy whom he answered | 14 |
+| She opened the door | opened fire , and the other . " She paused , and the other . " She laughed softly in | 20 |
+| The fire burned | alive , and the public safety , and his eyes flashed brightly glowing cheeks | 14 |
+| The river flows | south bank deposits . The main stream flowing | 8 |
+| The ship sailed | northward , and a big leagues farther inland navigation channel . The whole | 13 |
+| Dark clouds | of this matter | 3 |
+| The army marched | northward to the whole . The main | 7 |
+| Scientists discovered | that I believe I hope you think you find that they want to be more easily identified genes | 18 |
+| The volcano erupted | violently excited crowd , and the rest of his own room | 11 |
+| The old man walked | beside a woman , and the old lady , and the old gentleman , and his friend of the same age . It is a good fellow . " Oh boy . " I was a little girl who had | 40 |
 
 These outputs are topologically correct word sequences, not grammatically correct sentences. The walker produces dense, topic-relevant content with local grammatical fragments (trigram-level coherence) but limited long-range syntactic structure. See [Known Limitations](#known-limitations) for an honest assessment of what this system can and cannot do.
 
-**About token counts:** Generation runs with a soft cap of 20 tokens by default. Some prompts halt naturally before it — the walker stops when the semantic field is exhausted. The volcano, at 7 tokens, is an example of a sink-dominated prompt where the topology runs dry fast. "The old man walked" was run at 40 tokens to show richer topology sustaining longer output. The cap is configurable via `--max-tokens`.
+**About token counts:** Generation runs with a soft cap of 20 tokens by default. Some prompts halt naturally before it (the walker stops when the semantic field is exhausted). "Dark clouds" at 3 tokens and "The army marched" at 7 are examples of sink-dominated prompts where the topology runs dry fast. "The old man walked" was run at 40 tokens to show richer topology sustaining longer output. The cap is configurable via `--max-tokens`.
 
 ---
 
