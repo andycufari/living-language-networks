@@ -282,7 +282,7 @@ class LLNGraph:
         if delta_key in self.delta_tri:
             count = self.delta_tri[delta_key].get(next_idx, 0)
             if count > 0:
-                return 10.0  # massive boost for learned sequences
+                return 50.0  # episodic override for learned sequences
 
         # Fall back to base graph
         key = prev_idx * self.vocab_size + cur_idx
@@ -450,7 +450,15 @@ def find_targets(graph, prompt_indices, context_indices, activated, pmi_scores,
         in_deg = max(1, int(graph.in_degree[t]))
         pr_ratio = out_deg / in_deg
 
-        if pr_ratio < 0.4:
+        # Episodic priority: if ANY anchor has a delta edge to this target,
+        # it's directly reachable from short-term memory — massive boost
+        delta_reachable = any(
+            a in graph.delta_fwd and t in graph.delta_fwd[a]
+            for a in anchor_nodes
+        )
+        if delta_reachable:
+            score *= 10.0  # override all other routing
+        elif pr_ratio < 0.4:
             # Sink — penalize unless we're in the final stretch
             if tokens_remaining > 5:
                 score *= 0.2
@@ -493,16 +501,10 @@ def walk_to_target(graph, start, target, target_pmi, visited,
         candidates = []
 
         for cur, prev, path, cum_score in beam:
-            s = int(graph.fwd_off[cur])
-            e = int(graph.fwd_off[cur + 1])
-            if s == e:
+            # Use get_forward_edges (merges delta graph)
+            tgt, wgt = graph.get_forward_edges(cur, top_k=top_k)
+            if len(tgt) == 0:
                 continue
-
-            tgt = graph.fwd_tgt[s:e]
-            wgt = graph.fwd_wgt[s:e]
-            if len(tgt) > top_k:
-                top_idx = np.argpartition(wgt, -top_k)[-top_k:]
-                tgt, wgt = tgt[top_idx], wgt[top_idx]
 
             # Direct hit — return immediately
             for i in range(len(tgt)):
@@ -531,11 +533,21 @@ def walk_to_target(graph, start, target, target_pmi, visited,
                     n_tgts = set()
                     for j in range(ns, min(ne, ns + 100)):
                         n_tgts.add(int(graph.fwd_tgt[j]))
+                    # Also check delta edges from t toward target
+                    if t in graph.delta_fwd:
+                        n_tgts.update(graph.delta_fwd[t].keys())
                     overlap = len(n_tgts & target_out)
                     if overlap > 0:
                         proximity = min(overlap * 0.3, 2.0)
+                    # Direct delta edge from t to target
+                    if t in graph.delta_fwd and target in graph.delta_fwd[t]:
+                        proximity = 3.0
 
                 step_score = (norm_w * tri_mult) + (proximity * target_pmi)
+
+                # Episodic override: massive bonus for following learned edges
+                if cur in graph.delta_fwd and t in graph.delta_fwd[cur]:
+                    step_score += 50.0
 
                 visits = visited.get(t, 0)
                 if visits >= 3:
