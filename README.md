@@ -1,14 +1,14 @@
 # LLN — Living Language Network
 
-**Zero-parameter language generation from pure graph topology.**
+**Zero-parameter language generation from pure graph topology. With live learning.**
 
 No neural networks. No gradient descent. No learned weights.
-A directed weighted graph, a PMI activation field, and a biologically-inspired walker with beam search.
+A directed weighted graph, a PMI activation field, a biologically-inspired walker — and an episodic memory that learns in real time.
 
 ```bash
 pip install numpy lmdb huggingface_hub
 python generate.py --prompt "The fire burned"
-# → alive , and the public safety training camp with his eyes flashed brightly glowing cheeks
+# → alive . The government of the state police department s own personal safety training camp with his eyes flashed brightly
 ```
 
 The model downloads automatically from HuggingFace on first run (~2.1 GB).
@@ -19,15 +19,70 @@ The model downloads automatically from HuggingFace on first run (~2.1 GB).
 
 LLN builds a graph from raw text: nodes are words, edges are "word A followed word B", weights are co-occurrence counts. That's it — no training loop, no backpropagation, no parameters to learn.
 
-Generation works like the brain's dual language system:
+Generation works like the brain's language system:
 
 1. **Activate** (Wernicke) — Frequency-penalized PMI finds content word targets (WHAT to talk about)
 2. **Route** — Flow-aware target selection avoids topological dead ends (WHERE to aim)
 3. **Walk** (Broca) — Beam search across competing paths builds the grammar bridge (HOW to get there)
-4. **Deplete** — Hit a target, zero its activation, landscape shifts to next peak
-5. **Halt** — Semantic field exhausted, stop naturally
+4. **Remember** (Hippocampus) — A Delta Graph overlay provides O(1) short-term episodic memory, allowing real-time learning that overrides base habits
+5. **Deplete** — Hit a target, zero its activation, landscape shifts to next peak
+6. **Halt** — Semantic field exhausted, stop naturally
 
 Every decision is traceable. You can see exactly why each word was chosen.
+
+---
+
+## Live Learning: Zero-Gradient O(1) Memory
+
+LLN features an episodic memory overlay (a "Delta Graph"). It can learn new facts instantly without backpropagation, and it routes through them without catastrophic forgetting of the base graph.
+
+```bash
+python living.py
+```
+
+```
+>>> GENERATE: The terrifying monster
+  chain 0: target=ordeal (PMI=30.44, PR=0.14 [SINK])     → missed
+  chain 1: target=truck (PMI=24.18, PR=0.05 [SINK])      → reached: truck
+  ...
+  → truck . One important aspect of these little fellow creatures
+  (Base graph only — no knowledge of space monsters)
+
+>>> LEARN: The glorflax is a terrifying space monster that lurks behind dark nebula clouds
+  Learned 12 bigrams
+  Content words linked: monster, terrifying, space, lurks, nebula, clouds, dark, prey
+
+>>> GENERATE: The terrifying monster
+  chain 0: target=lurks (PMI=3220.98, PR=0.23 [SINK])    → reached: lurks
+  ...
+  → lurks behind every aspect of these little fellow creatures
+  (Delta Graph routes through "lurks behind" — learned 0.01s ago!)
+
+>>> FORGET
+  Short-term memory cleared.
+
+>>> GENERATE: The terrifying monster
+  → truck . One important aspect of these little fellow creatures
+  (Back to base graph. Zero catastrophic forgetting.)
+```
+
+The base graph (117.5M edges from 32GB of text) acts as **semantic memory** — deep, slow, permanent. The Delta Graph acts as **episodic memory** — fast, volatile, overriding. Just like the hippocampus overrides cortical habits with recent experience.
+
+**Try it yourself:**
+
+```bash
+python living.py
+
+# Teach it something it doesn't know
+>>> LEARN: The purple elephant danced gracefully through the moonlit garden
+
+# Now generate — it routes through the learned edges
+>>> GENERATE: The purple elephant
+→ guards  (from another learned sentence about purple elephants)
+
+# Clear memory — back to base behavior
+>>> FORGET
+```
 
 ---
 
@@ -39,7 +94,7 @@ Every decision is traceable. You can see exactly why each word was chosen.
 |--------|--------|--------|
 | The king | a more powerful voice heard my lord hath commanded thee thy life . The most famous letter addressed a | 20 |
 | She opened the door | opened fire on the door swung open . She paused abruptly closed the " " She laughed softly closed doors | 20 |
-| The fire burned | alive , and the public safety training camp with his eyes flashed brightly glowing cheeks | 15 |
+| The fire burned | alive . The government of the state police department s own personal safety training camp with his eyes flashed brightly | 20 |
 | The river flows | south bank of the most beautiful valley bottoms of water flow . The main stream flowing blood | 17 |
 | The ship sailed | northward along the right to go straight to him so forth a big leagues farther inland navigation channel the whole | 20 |
 | Dark clouds | that this matter is called a small village green leafy green energy | 12 |
@@ -69,18 +124,16 @@ python generate.py --prompt "The fire burned" --verbose
 ```
 
 ```
-chain 0:  target=extinguisher (PMI=134.21, 55 remaining) → missed (organic pruning)
-chain 1:  target=alive (PMI=28.36, 54 remaining)         → reached: alive
-chain 5:  target=safety (PMI=11.51, 33 remaining)        → reached: , and the public safety
-chain 8:  target=camp (PMI=6.18, 36 remaining)           → reached: training camp
-chain 10: target=eyes (PMI=4.82, 44 remaining)           → reached: with his eyes
-chain 11: target=flashed (PMI=8.84, 47 remaining)        → reached: flashed
-chain 12: target=brightly (PMI=3.96, 43 remaining)       → reached: brightly
-chain 13: target=glowing (PMI=6.93, 65 remaining)        → reached: glowing
-chain 14: target=cheeks (PMI=7.96, 71 remaining)         → reached: cheeks
+chain 0:  target=extinguisher (PMI=134.21, PR=0.75 [NEUTRAL]) → missed (organic pruning)
+chain 1:  target=alive (PMI=28.36, PR=0.02 [SINK])            → reached: alive
+chain 5:  target=safety (PMI=11.51, PR=0.02 [SINK])           → reached: , and the public safety
+chain 8:  target=camp (PMI=6.18, PR=0.02 [SINK])              → reached: training camp
+chain 10: target=eyes (PMI=24.08, PR=0.02 [SINK])             → reached: with his eyes
+chain 11: target=flashed (PMI=41.71, PR=0.04 [SINK])          → reached: flashed
+chain 12: target=brightly (PMI=19.82, PR=0.10 [SINK])         → reached: brightly
 ```
 
-Every target, every hit, every miss, every halt reason — visible.
+Every target, every hit, every miss, every halt reason — visible. The `PR` tag shows the topological mass classification (SINK/THROUGHPUT/SOURCE/NEUTRAL) that determines routing priority.
 
 ---
 
@@ -117,6 +170,9 @@ python generate.py --prompt "The king ruled"
 
 # With verbose tracing
 python generate.py --prompt "The ship sailed" --verbose
+
+# Interactive live learning mode
+python living.py
 
 # Custom model
 python generate.py --model path/to/your/model.lmdb --prompt "Hello world"
@@ -178,7 +234,8 @@ No GPU needed. The chunked trainer processes arbitrarily large corpora on machin
 - Output is topological word sequences, not grammatically correct sentences
 - Grammar quality is below GPT-2 — LLN wins on topic, not on syntax
 - Some corpus artifacts leak through (OpenWebText HTML fragments, Gutenberg archaisms)
-- Volcano/eruption-type prompts where all semantic targets are topological sinks still produce shorter output
+- Sink-dominated prompts (volcano/eruption) still produce shorter output
+- Live learning requires in-vocab words (OOV words like "glorflax" are skipped)
 
 ---
 
