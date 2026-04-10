@@ -2,14 +2,12 @@
 """LLN — Living Language Network Generator
 
 Zero-parameter language generation from graph topology.
-Profile-matching walker: scores candidates by distance from measured
-sentence anatomy, not by maximizing edge weight.
+Dual-system cognitive routing: PMI activation (Wernicke) + grammar walk (Broca).
 
 Usage:
     python generate.py --prompt "The fire burned"
     python generate.py --prompt "Scientists discovered" --max-tokens 20
     python generate.py --prompt "Dark clouds" --verbose
-    python generate.py --interactive
 
 The model is automatically downloaded from HuggingFace on first run.
 
@@ -20,7 +18,6 @@ import numpy as np
 import lmdb
 import json
 import struct
-import math
 import time
 import argparse
 import os
@@ -41,6 +38,7 @@ def download_model(model_dir=DEFAULT_MODEL_DIR):
         from huggingface_hub import hf_hub_download
         os.makedirs(model_dir, exist_ok=True)
 
+        # Download data.mdb
         path = hf_hub_download(
             repo_id=HF_REPO,
             filename="data.mdb",
@@ -49,6 +47,7 @@ def download_model(model_dir=DEFAULT_MODEL_DIR):
         )
         print(f"  Downloaded to {model_dir}")
 
+        # Remove stale lock file if present — LMDB regenerates it
         lock_path = os.path.join(model_dir, "lock.mdb")
         if os.path.exists(lock_path):
             os.remove(lock_path)
@@ -122,6 +121,7 @@ class LLNGraph:
         ).astype(np.int32)
 
     def _load_trigrams(self, txn):
+        """Load trigram index: (prev, cur) -> {next: count}."""
         tri_data = txn.get(b'trigrams_v2')
         if tri_data is None:
             return {}
@@ -143,6 +143,7 @@ class LLNGraph:
         return index
 
     def get_forward_edges(self, idx, top_k=50):
+        """Top-K forward edges by weight from the frozen CSR arrays."""
         s, e = int(self.fwd_off[idx]), int(self.fwd_off[idx + 1])
         if s == e:
             return np.array([], np.int32), np.array([], np.float32)
@@ -154,12 +155,19 @@ class LLNGraph:
         return tgt, wgt
 
     def get_pmi_neighbors(self, idx):
+        """PMI semantic neighbors from the frozen CSR arrays."""
         s, e = int(self.pmi_off[idx]), int(self.pmi_off[idx + 1])
         if s == e:
             return np.array([], np.int32), np.array([], np.float32)
         return self.pmi_tgt[s:e], self.pmi_wgt[s:e]
 
     def trigram_score(self, prev_idx, cur_idx, next_idx):
+        """Trigram multiplier from the base graph.
+
+        If the (prev, cur) pair exists in the trigram index but next_idx
+        was never observed after it, that's a grammar violation: hard 0.1x.
+        If no trigram data exists for this pair, stay neutral (1.0).
+        """
         key = prev_idx * self.vocab_size + cur_idx
         targets = self.trigrams.get(key)
         if targets is None:
@@ -176,6 +184,7 @@ class LLNGraph:
         return ' '.join(self.idx_to_word[i] for i in indices)
 
     def out_degree(self, idx):
+        """Out-degree from the frozen graph."""
         return int(self.fwd_off[idx + 1]) - int(self.fwd_off[idx])
 
     def close(self):
@@ -183,78 +192,9 @@ class LLNGraph:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Sentence Profile — measured from 545 real corpus sentences
-# ═══════════════════════════════════════════════════════════════════
-#
-# Each entry: (normalized_position, target_rank, target_pr, target_fwd_weight)
-#
-# Measured by .notes/sentence_anatomy.py on 545 sentences sampled from
-# the v16 training corpus (fineweb-edu + gutenberg + openwebtext).
-# The profile is corpus-invariant: all three sources produce profiles
-# within 20% of each other on every feature.
-#
-# Real sentences have a "wave" shape: rank oscillates 105-140, forward
-# weight stays in the 700K-1.5M band, pr_ratio stays 0.03-0.05.
-# This is the topological signature of English.
-
-SENTENCE_PROFILE = [
-    (0.00, 334, 0.05, 433000),
-    (0.10, 129, 0.03, 1119000),
-    (0.20, 120, 0.03, 1019000),
-    (0.30, 134, 0.03, 1026000),
-    (0.40, 138, 0.04, 1472000),
-    (0.50, 114, 0.04, 1229000),
-    (0.60, 132, 0.03, 1079000),
-    (0.70, 105, 0.04, 687000),
-    (0.80, 136, 0.03, 1384000),
-    (0.90, 105, 0.03, 808000),
-]
-
-
-def _profile_at(norm_pos):
-    """Interpolate the sentence profile at a normalized position [0, 1]."""
-    if norm_pos <= SENTENCE_PROFILE[0][0]:
-        return SENTENCE_PROFILE[0][1:]
-    if norm_pos >= SENTENCE_PROFILE[-1][0]:
-        return SENTENCE_PROFILE[-1][1:]
-    for i in range(len(SENTENCE_PROFILE) - 1):
-        p0, r0, pr0, w0 = SENTENCE_PROFILE[i]
-        p1, r1, pr1, w1 = SENTENCE_PROFILE[i + 1]
-        if p0 <= norm_pos <= p1:
-            t = (norm_pos - p0) / (p1 - p0)
-            return (r0 + t * (r1 - r0), pr0 + t * (pr1 - pr0), w0 + t * (w1 - w0))
-    return SENTENCE_PROFILE[-1][1:]
-
-
-def _build_rank_table(graph):
-    """Build rank[idx] = position in frequency-sorted vocab (0 = most common)."""
-    ranked = np.argsort(-graph.in_degree[:graph.vocab_size])
-    rank = np.empty(graph.vocab_size, dtype=np.int32)
-    for r in range(graph.vocab_size):
-        rank[int(ranked[r])] = r
-    return rank
-
-
-def _compute_weight_scale(graph):
-    """Compute the model's edge weight scale for profile normalization.
-
-    The sentence profile was measured on v16 (mean fwd_weight ~893).
-    Other models have different scales. This returns a multiplier so
-    that profile forward weights are expressed in model-native units.
-
-    Returns: scale factor to multiply profile fwd_weight targets by.
-    """
-    # Sample forward edge weights to find the model's mean
-    sample = graph.fwd_wgt[:min(len(graph.fwd_wgt), 2000000)]
-    sample = sample[sample > 0]
-    model_mean = float(np.mean(sample))
-    # Profile was measured on v16 where mean sorted fwd_weight ≈ 2082
-    PROFILE_MEAN = 2082.0
-    return model_mean / PROFILE_MEAN
-
-
-# ═══════════════════════════════════════════════════════════════════
 # Phase 1 — PMI Activation (Wernicke's Area)
+# Defines the semantic field: WHAT to talk about.
+# Frozen at T=0 — generated tokens never expand the goal.
 # ═══════════════════════════════════════════════════════════════════
 
 def activate(graph, prompt_indices, top_pct=0.20):
@@ -265,8 +205,10 @@ def activate(graph, prompt_indices, top_pct=0.20):
     that are ALSO semantically close get prioritized.
 
     Capital penalty: capitalized tokens that aren't sentence starters
-    are often title fragments (Ages, Horse, Elf, Jedi). Penalize by 0.3x.
+    (Ages, Horse, Elf, Jedi) are often title fragments, not content.
+    Penalize by 0.3x unless the prompt is all proper nouns.
     """
+    # Detect if prompt is all proper nouns (e.g. "New York")
     prompt_all_proper = all(
         graph.idx_to_word[i][0].isupper() for i in prompt_indices
         if graph.idx_to_word[i][0].isalpha()
@@ -293,13 +235,16 @@ def activate(graph, prompt_indices, top_pct=0.20):
     if not all_pmi:
         return set(prompt_indices), {}
 
+    # Adjust scores: frequency multiplier + capital penalty
     adjusted = {}
     for t, raw_pmi in all_pmi.items():
         freq_mult = float(np.log1p(graph.in_degree[t]))
         score = raw_pmi * freq_mult
+
         word = graph.idx_to_word[t]
         if not prompt_all_proper and word[0:1].isupper() and word[0:1].isalpha():
             score *= 0.3
+
         adjusted[t] = score
 
     weights = sorted(adjusted.values(), reverse=True)
@@ -309,11 +254,12 @@ def activate(graph, prompt_indices, top_pct=0.20):
         if score >= threshold:
             activated.add(t)
 
+    # Return adjusted scores (not raw PMI) so find_targets ranks correctly
     return activated, adjusted
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Phase 2 — Target Selection (PMI + Reachability + Flow)
+# Phase 2 — Target Selection (PMI ∩ Reachability)
 # ═══════════════════════════════════════════════════════════════════
 
 def find_targets(graph, prompt_indices, context_indices, activated, pmi_scores,
@@ -321,12 +267,13 @@ def find_targets(graph, prompt_indices, context_indices, activated, pmi_scores,
     """Find content targets: activated AND reachable in 2-3 hops.
 
     Flow-aware: uses out-degree / in-degree ratio as a fast proxy for
-    local push/receive mass. Sinks are penalized early in generation
-    and only allowed as targets in the final stretch.
+    local push/receive mass. Sinks (low ratio) are penalized early in
+    generation and only allowed as targets in the final stretch.
     """
     context_set = set(context_indices)
     last = context_indices[-1]
 
+    # Dual-anchored: explore from current position AND prompt nodes
     anchor_nodes = set(prompt_indices) | {last}
     reachable = {}
     for anchor in anchor_nodes:
@@ -362,14 +309,17 @@ def find_targets(graph, prompt_indices, context_indices, activated, pmi_scores,
         pmi_score = pmi_scores.get(t, 0)
         score = pmi_score * (4 - hop_dist)
 
+        # Flow-aware routing: out_degree / in_degree as fast mass proxy
         out_deg = graph.out_degree(t)
         in_deg = max(1, int(graph.in_degree[t]))
         pr_ratio = out_deg / in_deg
 
         if pr_ratio < 0.4:
+            # Sink — penalize unless we're in the final stretch
             if tokens_remaining > 5:
                 score *= 0.2
         elif pr_ratio >= 0.9:
+            # Throughput or source — boost
             score *= 1.5
 
         targets.append((t, score, pr_ratio))
@@ -379,29 +329,27 @@ def find_targets(graph, prompt_indices, context_indices, activated, pmi_scores,
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Phase 3 — Walk (Broca's Area) — Profile-Matching Beam Search
+# Phase 3 — Walk (Broca's Area)
 # ═══════════════════════════════════════════════════════════════════
 
-def walk_to_target(graph, start, target, target_pmi, visited, rank_table,
-                   prev_token=None, max_steps=8, top_k=50, beam_width=5,
-                   full_path_length=0, projected_length=15, weight_scale=1.0):
-    """Profile-matching beam search walk from start toward target.
+def walk_to_target(graph, start, target, target_pmi, visited,
+                   prev_token=None, max_steps=8, top_k=50, beam_width=5):
+    """Beam search walk from start toward target.
 
-    At each step, candidates are scored by how close their topological
-    features (rank, pr_ratio, forward weight) are to the measured
-    sentence profile at their normalized position. This produces output
-    whose topological shape matches real English sentences.
+    Maintains beam_width competing paths. Each step expands all paths,
+    scores candidates using global absolute log-mass (not local normalization),
+    and keeps the top beam_width by average score per step.
 
-    The profile was measured from 545 corpus sentences and is
-    corpus-invariant across fineweb-edu, gutenberg, and openwebtext.
+    Returns the first path that hits the target, or [] if none do.
     """
-    # Precompute target forward neighbors for topical bonus
+    # Precompute target's forward neighbors for proximity scoring
     ts = int(graph.full_off[target])
     te = int(graph.full_off[target + 1])
     target_out = set()
     for i in range(ts, min(te, ts + 500)):
         target_out.add(int(graph.full_tgt[i]))
 
+    # Each beam entry: (current_token, prev_token, path_tokens, cumulative_score)
     beam = [(start, prev_token, [], 0.0)]
 
     for step in range(max_steps):
@@ -419,69 +367,55 @@ def walk_to_target(graph, start, target, target_pmi, visited, rank_table,
 
             path_set = set(path)
 
-            # Position in the sentence for profile interpolation
-            norm_pos = min(1.0, max(0.0,
-                (full_path_length + len(path) + 1) / max(projected_length, 1)))
-            p_rank, p_pr, p_fwd_w = _profile_at(norm_pos)
-            target_rank = p_rank
-            target_pr = p_pr
-            target_fwd_w = p_fwd_w * weight_scale  # scale to model's edge weight range
-
             for i in range(len(tgt)):
                 t = int(tgt[i])
                 w = float(wgt[i])
 
+                # Strict path loop trap: never step on your own footprints
                 if t in path_set:
                     continue
 
-                # Candidate topology
-                cand_rank = int(rank_table[t])
-                cand_in_deg = int(graph.in_degree[t])
-                cand_out_deg = graph.out_degree(t)
-                cand_pr = cand_out_deg / max(cand_in_deg, 1)
+                # Global absolute log-mass (no local normalization)
+                norm_w = float(np.log1p(w)) * 0.1
 
-                # Profile distance (lower = closer to real sentence shape)
-                rank_dist = abs(math.log1p(cand_rank) - math.log1p(target_rank))
-                pr_dist = abs(cand_pr - target_pr) * 20.0
-                fwd_dist = abs(math.log1p(w) - math.log1p(target_fwd_w))
-                distance = rank_dist + pr_dist + fwd_dist
+                tri_mult = graph.trigram_score(prev, cur, t) if prev is not None else 1.0
 
-                # Topical bonus: does this candidate reach the target?
-                topical = 0.0
+                # Proximity: can t reach target in 1 hop? Neighborhood overlap?
+                proximity = 0.0
                 ns = int(graph.fwd_off[t])
                 ne = int(graph.fwd_off[t + 1])
-                direct_hit = False
                 for j in range(ns, min(ne, ns + 200)):
                     if int(graph.fwd_tgt[j]) == target:
-                        topical = 2.0
-                        direct_hit = True
+                        proximity = 3.0
                         break
-                if not direct_hit:
+                if proximity == 0:
                     n_tgts = set()
                     for j in range(ns, min(ne, ns + 100)):
                         n_tgts.add(int(graph.fwd_tgt[j]))
                     overlap = len(n_tgts & target_out)
                     if overlap > 0:
-                        topical = min(overlap * 0.2, 1.5)
+                        proximity = min(overlap * 0.3, 2.0)
 
-                topical *= math.log1p(max(target_pmi, 0.1))
-
-                # Score: minimize distance, add topical pull
-                score = -distance + (2.0 * topical)
+                # Log-compress target_pmi so pull doesn't drown grammar
+                # Without log: grammar ~3, pull ~75. With log: grammar ~3, pull ~10.
+                pull_strength = float(np.log1p(target_pmi))
+                step_score = (norm_w * tri_mult) + (proximity * pull_strength)
 
                 visits = visited.get(t, 0)
                 if visits >= 3:
-                    score -= 10.0
+                    step_score -= 10.0
                 elif visits > 0:
-                    score -= 0.5 * visits
+                    step_score -= 0.3 * visits
 
+                new_cum = cum_score + step_score
                 new_path = path + [t]
-                new_cum = cum_score + score
                 candidates.append((t, cur, new_path, new_cum))
 
         if not candidates:
             break
 
+        # Prune: keep top beam_width by average score per step
+        # Average prevents long paths from winning purely by accumulation
         candidates.sort(key=lambda c: -c[3] / len(c[2]))
         beam = candidates[:beam_width]
 
@@ -489,26 +423,162 @@ def walk_to_target(graph, start, target, target_pmi, visited, rank_table,
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Generate
+# Grammar-First Walker with Semantic Fencing
 # ═══════════════════════════════════════════════════════════════════
 
-def generate(graph, prompt_text, max_tokens=20, max_chains=15, verbose=False,
-             rank_table=None, projected_length=15, weight_scale=None):
-    """Generate text from a prompt.
+def generate_fenced(graph, prompt_text, max_tokens=20, verbose=False):
+    """Grammar-first generation with semantic fencing.
 
-    Activate -> find targets -> profile-matching walk -> deplete -> repeat.
+    Instead of walking TOWARD semantic targets (pathfinding),
+    walks GRAMMATICALLY within a semantic territory (fenced roaming).
+
+    The semantic field is a fence, not a destination. The walker follows
+    the strongest trigram-weighted paths within the territory. When it
+    lands on an activated content word, it depletes it. When no grammatical
+    path stays inside the fence, it halts.
     """
     prompt_indices = graph.tokenize(prompt_text)
     if not prompt_indices:
-        return {'text': prompt_text, 'generated_text': '',
-                'n_generated': 0, 'targets_reached': 0,
-                'targets_reached_words': []}
+        return {'text': prompt_text, 'generated_text': '', 'n_generated': 0,
+                'content_hits': 0, 'content_words': [], 'activated_size': 0}
 
-    if rank_table is None:
-        rank_table = _build_rank_table(graph)
-    if weight_scale is None:
-        weight_scale = _compute_weight_scale(graph)
+    # Phase 1: Activate semantic field (unchanged)
+    content_words = [i for i in prompt_indices if graph.in_degree[i] <= 20000]
+    top_pct = 0.40 if len(content_words) <= 3 else 0.20
+    activated, pmi_scores = activate(graph, prompt_indices, top_pct=top_pct)
 
+    # Build the FENCE: activated words + function words + punctuation
+    # Function words (in_degree > 5000) are grammatical glue, always allowed
+    FUNCTION_THRESHOLD = 5000
+    fence = set(activated)
+    function_words = set()
+    for i in range(graph.vocab_size):
+        if graph.in_degree[i] > FUNCTION_THRESHOLD:
+            fence.add(i)
+            function_words.add(i)
+        word = graph.idx_to_word[i]
+        if word in {'.', ',', ';', ':', '!', '?', '(', ')', '"', '-', "'"}:
+            fence.add(i)
+
+    if verbose:
+        n_content = len(activated) - len([i for i in activated if i in function_words])
+        print(f"  Fence: {len(fence)} total ({n_content} content + "
+              f"{len(function_words)} function words)")
+
+    # Phase 2: Grammar-first walk
+    generated = []
+    current = prompt_indices[-1]
+    prev_token = prompt_indices[-2] if len(prompt_indices) > 1 else None
+    visited_count = {t: 1 for t in prompt_indices}
+    depleted = set()
+    content_hits = []
+    stall_count = 0
+    MAX_STALL = 3
+
+    for step in range(max_tokens):
+        tgt, wgt = graph.get_forward_edges(current, top_k=100)
+        if len(tgt) == 0:
+            if verbose:
+                print(f"  [halt: no forward edges from '{graph.idx_to_word[current]}']")
+            break
+
+        # Score candidates: grammar only, filtered by fence
+        candidates = []
+        for i in range(len(tgt)):
+            t = int(tgt[i])
+            w = float(wgt[i])
+
+            if t not in fence:
+                continue
+            if visited_count.get(t, 0) >= 3:
+                continue
+
+            norm_w = float(np.log1p(w))
+            tri_mult = graph.trigram_score(prev_token, current, t) if prev_token is not None else 1.0
+            score = norm_w * tri_mult
+
+            # Visit penalty
+            v = visited_count.get(t, 0)
+            if v > 0:
+                score *= 0.5 ** v
+
+            # Content boost: prefer on-topic content over function word chains
+            is_content = (t in activated and t not in function_words and t not in depleted)
+            if is_content:
+                pmi = pmi_scores.get(t, 0)
+                score *= (1.0 + float(np.log1p(pmi)) * 0.3)
+
+            candidates.append((t, score))
+
+        if not candidates:
+            stall_count += 1
+            if stall_count >= MAX_STALL:
+                if verbose:
+                    print(f"  [halt: {MAX_STALL} consecutive stalls, fence exhausted]")
+                break
+            # Recovery: allow any grammatical step (temporary fence breach)
+            for i in range(len(tgt)):
+                t = int(tgt[i])
+                w = float(wgt[i])
+                if visited_count.get(t, 0) < 3:
+                    norm_w = float(np.log1p(w))
+                    tri_mult = graph.trigram_score(prev_token, current, t) if prev_token is not None else 1.0
+                    candidates.append((t, norm_w * tri_mult * 0.3))
+            if not candidates:
+                if verbose:
+                    print(f"  [halt: dead end at '{graph.idx_to_word[current]}']")
+                break
+        else:
+            stall_count = 0
+
+        candidates.sort(key=lambda x: -x[1])
+        chosen, chosen_score = candidates[0]
+
+        generated.append(chosen)
+        visited_count[chosen] = visited_count.get(chosen, 0) + 1
+        prev_token = current
+        current = chosen
+
+        is_content = (chosen in activated and
+                      chosen not in function_words and
+                      chosen not in depleted)
+        if is_content:
+            depleted.add(chosen)
+            content_hits.append(chosen)
+
+        if verbose:
+            word = graph.idx_to_word[chosen]
+            marker = " * CONTENT" if is_content else ""
+            if stall_count > 0:
+                marker += " [breach]"
+            print(f"  step {step:2d}: {word:15s} (score={chosen_score:.2f}){marker}")
+
+    return {
+        'text': graph.detokenize(prompt_indices + generated),
+        'prompt': prompt_text,
+        'generated_text': graph.detokenize(generated),
+        'n_generated': len(generated),
+        'content_hits': len(content_hits),
+        'content_words': [graph.idx_to_word[t] for t in content_hits],
+        'activated_size': len(activated),
+        'fence_size': len(fence),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Target-Driven Generate (original architecture)
+# ═══════════════════════════════════════════════════════════════════
+
+def generate(graph, prompt_text, max_tokens=20, max_chains=15, verbose=False):
+    """Generate text from a prompt.
+
+    Activate -> walk -> deplete -> re-target -> walk -> halt.
+    """
+    prompt_indices = graph.tokenize(prompt_text)
+    if not prompt_indices:
+        return {'text': prompt_text, 'generated_text': '', 'targets_reached_words': []}
+
+    # Widen activation for short prompts (≤3 content words)
     content_words = [i for i in prompt_indices if graph.in_degree[i] <= 20000]
     top_pct = 0.40 if len(content_words) <= 3 else 0.20
     activated, pmi_scores = activate(graph, prompt_indices, top_pct=top_pct)
@@ -535,6 +605,8 @@ def generate(graph, prompt_text, max_tokens=20, max_chains=15, verbose=False,
                 print(f"  [halt: semantic field exhausted after {len(generated)} tokens]")
             break
 
+        # Synaptic fatigue: later chains require stronger PMI to fire.
+        # Hyperbolic decay — halves at chain ~7, never reaches zero.
         fatigue = 1.0 / (1.0 + 0.15 * chain)
         targets = [(t, s * fatigue, pr) for t, s, pr in targets]
         targets.sort(key=lambda x: -x[1])
@@ -554,10 +626,7 @@ def generate(graph, prompt_text, max_tokens=20, max_chains=15, verbose=False,
                   f"(PMI={dest_score:.2f}, PR={dest_pr:.2f} [{role}], {len(targets)} remaining)")
 
         path = walk_to_target(graph, current, dest_idx, dest_score, visited,
-                              rank_table, prev_token=prev_token,
-                              full_path_length=len(prompt_indices) + len(generated),
-                              projected_length=projected_length,
-                              weight_scale=weight_scale)
+                              prev_token=prev_token)
 
         reached = len(path) > 0 and path[-1] == dest_idx
 
@@ -625,8 +694,11 @@ def main():
                         help="Show target selection details")
     parser.add_argument("--interactive", action="store_true",
                         help="Interactive mode: load model once, prompt repeatedly")
+    parser.add_argument("--fenced", action="store_true",
+                        help="Grammar-first walker with semantic fencing (experimental)")
     args = parser.parse_args()
 
+    # Resolve model path
     if args.model:
         model_path = args.model
     else:
@@ -635,16 +707,17 @@ def main():
     print(f"Loading model...", end=" ", flush=True)
     t0 = time.time()
     graph = LLNGraph(model_path)
-    rank_table = _build_rank_table(graph)
-    weight_scale = _compute_weight_scale(graph)
     load_time = time.time() - t0
     print(f"done ({load_time:.1f}s)")
     print(f"  Vocab: {graph.vocab_size:,} | Edges: {len(graph.full_tgt):,} | "
           f"PMI: {len(graph.pmi_tgt):,} | Trigrams: {len(graph.trigrams):,}")
     print()
 
+    gen_fn = generate_fenced if args.fenced else generate
+
     if args.interactive:
-        print("Interactive mode. Type a prompt, or 'quit' to exit.\n")
+        mode = "fenced" if args.fenced else "target-driven"
+        print(f"Interactive mode ({mode}). Type a prompt, or 'quit' to exit.\n")
         while True:
             try:
                 prompt = input(">>> ").strip()
@@ -656,28 +729,28 @@ def main():
                     print("Bye.")
                 break
             t0 = time.time()
-            result = generate(graph, prompt, max_tokens=args.max_tokens,
-                              verbose=args.verbose, rank_table=rank_table,
-                              weight_scale=weight_scale)
+            result = gen_fn(graph, prompt, max_tokens=args.max_tokens, verbose=args.verbose)
             gen_time = time.time() - t0
             print(f"  -> {result['generated_text']}")
-            print(f"     [{result['n_generated']} tokens, "
-                  f"{result['targets_reached']} hits, {gen_time:.3f}s]")
+            hits = result.get('content_hits', result.get('targets_reached', 0))
+            print(f"     [{result['n_generated']} tokens, {hits} hits, {gen_time:.3f}s]")
+            if args.fenced and result.get('content_words'):
+                print(f"     content: {', '.join(result['content_words'])}")
             print()
     else:
         prompts = args.prompt if args.prompt else DEFAULT_PROMPTS
 
         for prompt in prompts:
             t0 = time.time()
-            result = generate(graph, prompt, max_tokens=args.max_tokens,
-                              verbose=args.verbose, rank_table=rank_table,
-                              weight_scale=weight_scale)
+            result = gen_fn(graph, prompt, max_tokens=args.max_tokens, verbose=args.verbose)
             gen_time = time.time() - t0
 
             print(f"  \"{prompt}\"")
             print(f"  -> {result['generated_text']}")
-            print(f"     [{result['n_generated']} tokens, "
-                  f"{result['targets_reached']} hits, {gen_time:.3f}s]")
+            hits = result.get('content_hits', result.get('targets_reached', 0))
+            print(f"     [{result['n_generated']} tokens, {hits} hits, {gen_time:.3f}s]")
+            if args.fenced and result.get('content_words'):
+                print(f"     content: {', '.join(result['content_words'])}")
             print()
 
     graph.close()
