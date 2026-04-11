@@ -10,14 +10,11 @@ python generate.py --prompt "The fire burned" --verbose
 ```
 
 ```
-chain 1:  target=alive (PMI=28.36, PR=0.02 [SINK])       → reached: alive
-chain 5:  target=safety (PMI=11.51, PR=0.02 [SINK])      → reached: with his own personal safety
-chain 8:  target=camp (PMI=6.18, PR=0.02 [SINK])         → reached: training camp
-chain 10: target=eyes (PMI=4.82, PR=0.02 [SINK])         → reached: with his eyes
-chain 11: target=flashed (PMI=8.34, PR=0.04 [SINK])      → reached: flashed
-chain 12: target=brightly (PMI=3.96, PR=0.10 [SINK])     → reached: brightly
-chain 13: target=glowing (PMI=6.93, PR=0.07 [SINK])      → reached: glowing
-chain 14: target=cheeks (PMI=7.96, PR=0.11 [SINK])       → reached: cheeks
+chain 0:  target=extinguisher (PMI=134.21, PR=0.75 [NEUTRAL])  → missed (organic pruning)
+chain 1:  target=alive (PMI=28.36, PR=0.02 [SINK])             → reached: alive
+chain 2:  target=department (PMI=20.83, PR=0.03 [SINK])        → reached: . On the state police department
+chain 5:  target=safety (PMI=11.51, PR=0.02 [SINK])            → reached: of them to their own personal safety
+chain 6:  target=protection (PMI=9.93, PR=0.02 [SINK])         → reached: and for you will provide protection
 ```
 
 Every word is traceable. Every target, every hit, every miss, every halt reason — visible. The model downloads automatically from HuggingFace on first run (~2.1 GB).
@@ -66,16 +63,12 @@ python generate.py --prompt "The fire burned" --verbose
 ```
 chain 0:  target=extinguisher (PMI=134.21, PR=0.75 [NEUTRAL])  → missed (organic pruning)
 chain 1:  target=alive (PMI=28.36, PR=0.02 [SINK])             → reached: alive
-chain 5:  target=safety (PMI=11.51, PR=0.02 [SINK])            → reached: with his own personal safety
-chain 8:  target=camp (PMI=6.18, PR=0.02 [SINK])               → reached: training camp
-chain 10: target=eyes (PMI=4.82, PR=0.02 [SINK])               → reached: with his eyes
-chain 11: target=flashed (PMI=8.34, PR=0.04 [SINK])            → reached: flashed
-chain 12: target=brightly (PMI=3.96, PR=0.10 [SINK])           → reached: brightly
-chain 13: target=glowing (PMI=6.93, PR=0.07 [SINK])            → reached: glowing
-chain 14: target=cheeks (PMI=7.96, PR=0.11 [SINK])             → reached: cheeks
+chain 2:  target=department (PMI=20.83, PR=0.03 [SINK])        → reached: . On the state police department
+chain 5:  target=safety (PMI=11.51, PR=0.02 [SINK])            → reached: of them to their own personal safety
+chain 6:  target=protection (PMI=9.93, PR=0.02 [SINK])         → reached: and for you will provide protection
 ```
 
-Every target selection shows the PMI score that justified the walk and the topological role (SINK/THROUGHPUT/SOURCE) that determined routing priority. You can trace exactly why "extinguisher" was attempted and failed (organic pruning, no beam path reached it in 8 steps), and why "alive" succeeded (1-hop from "burned"). The model is a glass box.
+Every target selection shows the PMI score that justified the walk and the topological role (SINK/THROUGHPUT/SOURCE) that determined routing priority. You can trace exactly why "extinguisher" was attempted and failed (organic pruning, no beam path reached it in 8 steps), why "alive" succeeded (1-hop from "burned"), and how the walker bridged to "personal safety" and "provide protection" — fire-domain vocabulary reached through profile-matching grammar paths. The model is a glass box.
 
 ---
 
@@ -83,18 +76,18 @@ Every target selection shows the PMI score that justified the walk and the topol
 
 | Prompt | Output | Tokens |
 |--------|--------|--------|
-| The king | of its most powerful voice heard my lord hath commanded thee thy people who had a small boy whom he | 20 |
-| She opened the door | open fire of her eyes closed doors locked in front door opening the city hall porter | 16 |
-| The fire burned | alive with his own personal safety training camp with his eyes flashed brightly glowing cheeks | 15 |
-| The river flows | north bank of water flow of its main stream flowing blood | 11 |
-| The ship sailed | northward across the way to go far south west of what he went straight up the people who came forth | 20 |
+| The king | , so much more powerful and he heard my lord hath commanded thee thy name of my boy whom he | 20 |
+| She opened the door | opened fire . She paused , his eyes closed the " She laughed softly in front door opening the city | 20 |
+| The fire burned | alive . On the state police department of them to their own personal safety and for you will provide protection | 20 |
+| The river flows | north bank of her the way to go far south of water flow of its main stream flowing blood flow | 20 |
+| The ship sailed | northward across the way to go far south west of him to go straight to come forth a big leagues | 20 |
 | Dark clouds | that this matter of an increase energy | 7 |
-| The army marched | northward along the right to go straight white supremacists and so much more advanced rapidly than three other two young | 20 |
-| Scientists discovered | that we believe that she began studying the only hope you might expect to think you find you want more | 20 |
-| The volcano erupted | violently against the world war s largest | 7 |
-| The old man walked | beside him go straight off the very much more advanced rapidly than a woman was his friend of any age of my little fellow - old boy s a little girl | 31 |
+| The army marched | northward to go straight white supremacists and so much more advanced rapidly , his brother officers came forward . An | 20 |
+| Scientists discovered | that we believe I hope you would expect to think you find the people want more easily identified as they | 20 |
+| The volcano erupted | violently against the world war against the s largest of such a long - based violence | 16 |
+| The old man walked | beside him to go straight away , so much more advanced rapidly . No woman in my dear lady , his old gentleman who have the old chap . With a young man's best friend of any age of my | 40 |
 
-These outputs are topologically guided word sequences. The profile-matching walker produces multi-word coherent units ("my lord hath commanded thee thy", "personal safety training camp", "main stream flowing blood") by matching the measured topological signature of real English sentences, rather than maximizing edge weight. See [Known Limitations](#known-limitations) for an honest assessment.
+These outputs are topologically guided word sequences. The profile-matching walker produces multi-word coherent units ("my lord hath commanded thee thy", "his brother officers came forward", "main stream flowing blood flow") by matching the measured topological signature of real English sentences, rather than maximizing edge weight. See [Known Limitations](#known-limitations) for an honest assessment.
 
 **About token counts:** Generation runs with a soft cap of 20 tokens by default. Some prompts halt naturally before it (the walker stops when the semantic field is exhausted). "The old man walked" was run at 40 tokens to show extended generation. The cap is configurable via `--max-tokens`.
 

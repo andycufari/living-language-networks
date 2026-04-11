@@ -250,7 +250,11 @@ def _compute_weight_scale(graph):
     model_mean = float(np.mean(sample))
     # Profile was measured on v16 where mean sorted fwd_weight ≈ 2082
     PROFILE_MEAN = 2082.0
-    return model_mean / PROFILE_MEAN
+    scale = model_mean / PROFILE_MEAN
+    # Snap to 1.0 if within 5% — avoids float drift on the reference model
+    if 0.95 <= scale <= 1.05:
+        return 1.0
+    return scale
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -441,9 +445,10 @@ def walk_to_target(graph, start, target, target_pmi, visited, rank_table,
                 cand_pr = cand_out_deg / max(cand_in_deg, 1)
 
                 # Profile distance (lower = closer to real sentence shape)
-                rank_dist = abs(math.log1p(cand_rank) - math.log1p(target_rank))
+                # Weights: rank 0.5, pr 20.0, fwd 1.5 (tuned via .notes/tune_manual.py)
+                rank_dist = abs(math.log1p(cand_rank) - math.log1p(target_rank)) * 0.5
                 pr_dist = abs(cand_pr - target_pr) * 20.0
-                fwd_dist = abs(math.log1p(w) - math.log1p(target_fwd_w))
+                fwd_dist = abs(math.log1p(w) - math.log1p(target_fwd_w)) * 1.5
                 distance = rank_dist + pr_dist + fwd_dist
 
                 # Topical bonus: does this candidate reach the target?
@@ -466,8 +471,8 @@ def walk_to_target(graph, start, target, target_pmi, visited, rank_table,
 
                 topical *= math.log1p(max(target_pmi, 0.1))
 
-                # Score: minimize distance, add topical pull
-                score = -distance + (2.0 * topical)
+                # Score: minimize distance, add topical pull (2.5 tuned)
+                score = -distance + (2.5 * topical)
 
                 visits = visited.get(t, 0)
                 if visits >= 3:
