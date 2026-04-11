@@ -95,7 +95,42 @@ measurable dimension. v3 matches the measured wave — moderate weights,
 moderate ranks, moderate trigram density. This IS how English works
 topologically.
 
+**Tuned weights** (commit f08b956): rank=0.5, fwd=1.5, topical=2.5.
+Weight scale auto-normalization for cross-model portability.
+
 **File**: `generate.py` (replaced v1)
+
+---
+
+## Current status (2026-04-11)
+
+**Output quality**: phrase salad — between word salad and broken sentences.
+
+The walker produces recognizable multi-word units but cannot connect them
+into grammatical sentences. Specific problems:
+
+1. No clause structure (no subject-verb-object awareness)
+2. Register drift (archaic mixes with modern mid-sentence)
+3. Topical drift (OpenWebText vocabulary leaks into unrelated prompts)
+4. No sentence ending (outputs hit token cap mid-phrase)
+
+```
+Quality spectrum:
+  Word salad:        "army infantry artillery cavalry troops"
+  Phrase salad:      "his brother officers came forward . An"     ← HERE
+  Broken sentences:  "The officers came forward but the army"
+  Correct sentences: "The army's officers came forward at dawn."
+```
+
+**What's needed for "broken sentences"** (next quality level):
+- Structural position awareness (know WHAT ROLE each position plays, not just what rank)
+- Clause boundary detection (know when to emit `.` and start a new clause)
+- Register locking (once archaic, stay archaic)
+- Two-pass architecture (content skeleton first, grammatical infill second)
+
+**The approach is viable.** The gap from "phrase salad" to "broken sentences"
+is smaller than the gap from "word salad" to "phrase salad" — and we crossed
+that gap in this session.
 
 ---
 
